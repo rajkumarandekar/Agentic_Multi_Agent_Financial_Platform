@@ -9,6 +9,12 @@ langchain-groq==0.2.1
 langchain-huggingface==0.1.2
 langchain-chroma==0.1.4
 
+# Phase 2 additions
+langgraph==0.2.53
+langchain-experimental==0.3.3
+mcp==1.9.0
+langchain-mcp-adapters==0.1.0
+
 # Embeddings
 sentence-transformers==3.3.1
 
