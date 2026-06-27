@@ -30,8 +30,8 @@ from orchestration.state import AgentState  # noqa: E402
 
 app = FastAPI(
     title="Agentic AI Platform",
-    description="Phase 2 — LangGraph supervisor routing to RAG, SQL, and MCP tool agents",
-    version="0.2.0",
+    description="Phase 3 — Guardrails (input + output) + eval harness",
+    version="0.3.0",
 )
 
 
@@ -91,6 +91,7 @@ class AgentResponse(BaseModel):
     agent_used: str
     answer: str
     sources: list[SourceItem]
+    guardrails: dict
 
 
 @app.post("/agent", response_model=AgentResponse)
@@ -98,15 +99,17 @@ async def agent_endpoint(body: AgentRequest) -> AgentResponse:
     """
     Route the question through the LangGraph supervisor to the appropriate agent.
 
-    The supervisor classifies the question as:
-      - rag  → retrieves from ChromaDB and answers with Groq
-      - sql  → queries the shipments SQLite DB and answers with Groq
-      - tool → uses the MCP filesystem server to inspect local files
+    Phase 3 flow: input_guard → supervisor → agent → output_guard
 
-    Prerequisites:
-      - For rag:  run python -m ingestion.pdf_ingest <file.pdf> first
-      - For sql:  run python scripts/seed_db.py first
-      - For tool: Node.js must be installed (npx is used to launch the MCP server)
+    Guardrails applied automatically:
+      - Input:  injection-pattern regex + LLM safety classifier
+      - Output: PII masking (email/phone/SSN/card) + toxicity classifier
+      The 'guardrails' field in the response shows pass/fail per check.
+
+    Routing:
+      - rag  → ChromaDB retrieval + Groq answer
+      - sql  → SQLite shipments query + Groq answer
+      - tool → native file-list / calculator tools + Groq answer
     """
     initial_state = AgentState(
         question=body.question,
@@ -115,6 +118,7 @@ async def agent_endpoint(body: AgentRequest) -> AgentResponse:
         answer="",
         sources=[],
         agent_used="",
+        guardrail_results={},
     )
     try:
         result = await graph.ainvoke(initial_state)
@@ -129,4 +133,5 @@ async def agent_endpoint(body: AgentRequest) -> AgentResponse:
         agent_used=result["agent_used"],
         answer=result["answer"],
         sources=[SourceItem(**s) for s in result.get("sources", [])],
+        guardrails=result.get("guardrail_results", {}),
     )
