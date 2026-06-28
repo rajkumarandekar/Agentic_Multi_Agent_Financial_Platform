@@ -8,6 +8,7 @@ Run directly:
 import os
 import sys
 
+import chromadb
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -67,7 +68,12 @@ def ingest(pdf_path: str) -> int:
     chunks = splitter.split_documents(pages)
     print(f"[ingest] Split into {len(chunks)} chunks")
 
-    # 3. Embed + store — Chroma handles embedding each chunk and persisting.
+    # 3. Tag each chunk with the source filename so retrieval can filter by document.
+    basename = os.path.basename(pdf_path)
+    for chunk in chunks:
+        chunk.metadata["source_document"] = basename
+
+    # 4. Embed + store — Chroma handles embedding each chunk and persisting.
     embeddings = _get_embeddings()
     vectorstore = _get_vectorstore(embeddings)
     vectorstore.add_documents(chunks)
@@ -76,16 +82,45 @@ def ingest(pdf_path: str) -> int:
     return len(chunks)
 
 
-def get_retriever(k: int = 4) -> Chroma:
+def get_retriever(k: int = 4, source_document: str | None = None) -> Chroma:
     """
     Return a LangChain retriever backed by the persisted ChromaDB collection.
 
     Args:
-        k: Number of chunks to retrieve per query.
+        k:               Number of chunks to retrieve per query.
+        source_document: If set, restrict retrieval to chunks from this filename only.
+                         None (default) searches all chunks across all documents.
     """
     embeddings = _get_embeddings()
     vectorstore = _get_vectorstore(embeddings)
-    return vectorstore.as_retriever(search_kwargs={"k": k})
+    search_kwargs: dict = {"k": k}
+    if source_document:
+        search_kwargs["filter"] = {"source_document": source_document}
+    return vectorstore.as_retriever(search_kwargs=search_kwargs)
+
+
+def list_documents() -> list[str]:
+    """
+    Return distinct source_document values stored in ChromaDB.
+
+    Uses the raw chromadb client (no embedding model needed) so this is fast.
+    Returns an empty list if the collection does not yet exist.
+    """
+    print(f"[list_documents] path={os.path.abspath(CHROMA_PERSIST_DIR)!r} collection={COLLECTION_NAME!r}")
+    try:
+        client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+        collection = client.get_collection(COLLECTION_NAME)
+    except Exception as exc:
+        print(f"[list_documents] could not open collection: {type(exc).__name__}: {exc}")
+        return []
+    result = collection.get(include=["metadatas"])
+    metas = result.get("metadatas", [])
+    seen: set[str] = set()
+    for meta in metas:
+        if meta and "source_document" in meta:
+            seen.add(meta["source_document"])
+    print(f"[list_documents] chunks={len(metas)}, distinct docs={len(seen)}: {sorted(seen)}")
+    return sorted(seen)
 
 
 if __name__ == "__main__":

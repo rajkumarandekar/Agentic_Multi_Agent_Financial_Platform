@@ -37,20 +37,25 @@ def _build_context(docs: list) -> str:
     return "\n\n".join(parts)
 
 
-def ask(question: str, k: int = TOP_K) -> RAGResult:
+def ask(
+    question: str,
+    k: int = TOP_K,
+    source_document: str | None = None,
+) -> RAGResult:
     """
     Retrieve relevant chunks and generate an answer.
 
     Args:
-        question: The user's question.
-        k:        Number of chunks to retrieve.
+        question:        The user's question (may include conversation context).
+        k:               Number of chunks to retrieve.
+        source_document: If set, restrict retrieval to chunks from this file only.
 
     Returns:
         RAGResult with 'answer' (str) and 'sources' (list of dicts with
-        keys 'page' and 'snippet').
+        keys 'page', 'snippet', and 'source_document').
     """
     # 1. Retrieve — similarity search returns the k most relevant Document objects.
-    retriever = get_retriever(k=k)
+    retriever = get_retriever(k=k, source_document=source_document)
     docs = retriever.invoke(question)
 
     # 2. Build context — join chunks so the LLM sees them all in one prompt.
@@ -67,8 +72,9 @@ def ask(question: str, k: int = TOP_K) -> RAGResult:
     # 4. Build sources list for the API response.
     sources = [
         {
-            "page": doc.metadata.get("page", "?"),
-            "snippet": doc.page_content[:200],
+            "page":            doc.metadata.get("page", "?"),
+            "snippet":         doc.page_content[:200],
+            "source_document": doc.metadata.get("source_document", ""),
         }
         for doc in docs
     ]

@@ -9,7 +9,7 @@ import os
 
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 from orchestration.state import AgentState
 
@@ -42,12 +42,36 @@ def supervisor_node(state: AgentState) -> dict:
     """
     Classify the user's question and set state["route"].
 
+    For multi-turn sessions, the last few messages from the conversation are
+    included as context so follow-up questions like "what about the pending
+    ones?" can be routed correctly based on the prior exchange.
+
     Returns only {"route": <str>} — LangGraph merges this into the full state.
     """
     llm = ChatGroq(model=GROQ_MODEL, temperature=0)
+
+    # Build a short context block from the previous turn(s).
+    # state["messages"] ends with the current HumanMessage; everything before
+    # it is prior conversation history. Cap at last 4 messages (2 exchanges).
+    history = state.get("messages", [])
+    prior = history[:-1][-4:] if len(history) > 1 else []
+
+    if prior:
+        lines = []
+        for m in prior:
+            role = "User" if isinstance(m, HumanMessage) else "Assistant"
+            lines.append(f"{role}: {m.content[:200]}")
+        context_block = "\n".join(lines)
+        classify_text = (
+            f"[Prior conversation]\n{context_block}\n\n"
+            f"[New question to classify]\n{state['question']}"
+        )
+    else:
+        classify_text = state["question"]
+
     response = llm.invoke([
         SystemMessage(content=_CLASSIFY_SYSTEM),
-        HumanMessage(content=state["question"]),
+        HumanMessage(content=classify_text),
     ])
     route = response.content.strip().lower()
 
@@ -55,5 +79,5 @@ def supervisor_node(state: AgentState) -> dict:
     if route not in _VALID_ROUTES:
         route = "rag"
 
-    print(f"[supervisor] '{state['question'][:60]}...' → route={route}")
+    print(f"[supervisor] '{state['question'][:60]}' → route={route}")
     return {"route": route}

@@ -18,8 +18,9 @@ The compiled graph is a module-level singleton — built once at import time
 and reused for every request.
 """
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
 
 from orchestration.state import AgentState
 from orchestration.supervisor import supervisor_node
@@ -28,6 +29,33 @@ from guardrails.output_guard import check_output
 from agents.rag_agent import ask as rag_ask
 from agents.sql_agent import run as sql_run
 from agents.tool_agent import run as tool_run
+
+
+# ---------------------------------------------------------------------------
+# Conversation-context helper
+# ---------------------------------------------------------------------------
+
+def _contextual_question(state: AgentState) -> str:
+    """
+    Return the current question enriched with recent conversation history.
+
+    state["messages"] ends with the current HumanMessage; everything before it
+    is prior turns. We prepend at most 6 prior messages (3 exchanges) as a
+    short context block so the agent LLM can resolve follow-up references like
+    "what about the pending ones?" without seeing the bare question alone.
+
+    If there is no history the bare question is returned unchanged.
+    """
+    history = state.get("messages", [])
+    prior = history[:-1][-6:] if len(history) > 1 else []
+    if not prior:
+        return state["question"]
+    lines = []
+    for m in prior:
+        role = "User" if isinstance(m, HumanMessage) else "Assistant"
+        lines.append(f"{role}: {m.content[:300]}")
+    context = "\n".join(lines)
+    return f"[Conversation history]\n{context}\n\n[Current question]\n{state['question']}"
 
 
 # ---------------------------------------------------------------------------
@@ -79,34 +107,40 @@ def output_guard_node(state: AgentState) -> dict:
 
 def rag_node(state: AgentState) -> dict:
     """Invoke the RAG agent and populate answer + sources in state."""
-    result = rag_ask(state["question"])
+    doc_filter = state.get("source_document") or None
+    # When a specific document is selected the answer must come from its chunks,
+    # not from conversation memory that may contain facts about a different person/doc.
+    # Skip the history prefix so retrieved context cannot be overridden by prior turns.
+    question = state["question"] if doc_filter else _contextual_question(state)
+    result = rag_ask(question, source_document=doc_filter)
+    # Return only the new AIMessage — the add_messages reducer appends it.
     return {
         "answer":     result["answer"],
         "sources":    result["sources"],
         "agent_used": "rag",
-        "messages":   state["messages"] + [AIMessage(content=result["answer"])],
+        "messages":   [AIMessage(content=result["answer"])],
     }
 
 
 def sql_node(state: AgentState) -> dict:
     """Invoke the SQL agent and populate answer in state."""
-    answer = sql_run(state["question"])
+    answer = sql_run(_contextual_question(state))
     return {
         "answer":     answer,
         "sources":    [],
         "agent_used": "sql",
-        "messages":   state["messages"] + [AIMessage(content=answer)],
+        "messages":   [AIMessage(content=answer)],
     }
 
 
 async def tool_node(state: AgentState) -> dict:
     """Invoke the native tool agent (async) and populate answer in state."""
-    answer = await tool_run(state["question"])
+    answer = await tool_run(_contextual_question(state))
     return {
         "answer":     answer,
         "sources":    [],
         "agent_used": "tool",
-        "messages":   state["messages"] + [AIMessage(content=answer)],
+        "messages":   [AIMessage(content=answer)],
     }
 
 
@@ -164,7 +198,10 @@ def _build() -> StateGraph:
     # output_guard is the single exit point
     builder.add_edge("output_guard", END)
 
-    return builder.compile()
+    # MemorySaver persists AgentState (including the full messages list) keyed
+    # by thread_id. Each /agent request passes its session_id as thread_id so
+    # conversation history accumulates across turns within a session.
+    return builder.compile(checkpointer=MemorySaver())
 
 
 # Compiled at import time — reused across all requests
