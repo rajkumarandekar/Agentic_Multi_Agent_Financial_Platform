@@ -7,3 +7,8 @@ __pycache__/
 venv/
 *.egg-info/
 dist/
+
+data/*.pdf
+node_modules/
+frontend/dist/
+chroma_store/
