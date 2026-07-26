@@ -73,7 +73,7 @@ def ingest(pdf_path: str) -> int:
     for chunk in chunks:
         chunk.metadata["source_document"] = basename
 
-    # 4. Embed + store — Chroma handles embedding each chunk and persisting.
+    # 4. Embed + store — accumulates alongside any previously ingested docs this session.
     embeddings = _get_embeddings()
     vectorstore = _get_vectorstore(embeddings)
     vectorstore.add_documents(chunks)
@@ -82,21 +82,41 @@ def ingest(pdf_path: str) -> int:
     return len(chunks)
 
 
+def reset_collection() -> None:
+    """
+    Delete all documents from ChromaDB.
+    Called on page load so each browser session starts with a clean slate.
+    """
+    try:
+        client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+        client.delete_collection(COLLECTION_NAME)
+        print(f"[reset] Collection '{COLLECTION_NAME}' deleted")
+    except Exception:
+        # Collection may not exist yet on first ever load — that's fine
+        print(f"[reset] Collection '{COLLECTION_NAME}' did not exist, nothing to clear")
+
+
 def get_retriever(k: int = 4, source_document: str | None = None) -> Chroma:
     """
     Return a LangChain retriever backed by the persisted ChromaDB collection.
 
+    Uses MMR (Maximal Marginal Relevance) to retrieve k diverse, relevant chunks.
+    fetch_k candidates are scored first; MMR selects k from those for diversity.
+
     Args:
-        k:               Number of chunks to retrieve per query.
+        k:               Number of chunks to return per query.
         source_document: If set, restrict retrieval to chunks from this filename only.
-                         None (default) searches all chunks across all documents.
     """
     embeddings = _get_embeddings()
     vectorstore = _get_vectorstore(embeddings)
-    search_kwargs: dict = {"k": k}
+    search_kwargs: dict = {"k": k, "fetch_k": max(k * 5, 20)}
     if source_document:
         search_kwargs["filter"] = {"source_document": source_document}
-    return vectorstore.as_retriever(search_kwargs=search_kwargs)
+        print(f"[retriever] source_document filter={source_document!r} k={k} fetch_k={search_kwargs['fetch_k']}")
+    return vectorstore.as_retriever(
+        search_type="mmr",
+        search_kwargs=search_kwargs,
+    )
 
 
 def list_documents() -> list[str]:

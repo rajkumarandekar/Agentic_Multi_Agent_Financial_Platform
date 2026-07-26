@@ -9,6 +9,16 @@ venv/
 dist/
 
 data/*.pdf
+data/checkpoints.db
+data/checkpoints.db-wal
+data/checkpoints.db-shm
+data/company.db
+data/chats.db
+data/chats.db-wal
+data/chats.db-shm
+data/company_data.xlsx
+dbg_*.txt
 node_modules/
 frontend/dist/
 chroma_store/
+.pytest_cache/

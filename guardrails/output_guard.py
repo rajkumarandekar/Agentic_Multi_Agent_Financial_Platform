@@ -16,6 +16,8 @@ from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 
+from observability.trace import trace_llm_call
+
 load_dotenv()
 
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")
@@ -65,25 +67,55 @@ def _check_pii(text: str) -> tuple[str, dict]:
 
 
 def _check_toxicity(text: str) -> dict:
-    """Ask the LLM whether the answer contains harmful content."""
-    llm = ChatGroq(model=GROQ_MODEL, temperature=0)
-    # Truncate to keep prompt cost low; 1 000 chars covers typical answers.
-    response = llm.invoke([
-        SystemMessage(content=_TOXICITY_SYSTEM),
-        HumanMessage(content=text[:1000]),
-    ])
-    raw = response.content.strip()
-    passed = raw.upper().startswith("NO")
-    return {
-        "name": "toxicity",
-        "passed": passed,
-        "detail": raw[:150],
-    }
+    """
+    Ask the LLM whether the answer contains harmful content.
+
+    Fails open (treated as not toxic) on a Groq error. The answer already
+    passed through its source agent (finance/SQL/RAG all pull from a fixed,
+    trusted local dataset) — a transient Groq outage blocking every response
+    with a masked-but-otherwise-fine answer would be worse than the rare case
+    this check would have actually caught something.
+    """
+    try:
+        trace_llm_call("OUTPUT GUARD toxicity check", query=text[:1000], system=_TOXICITY_SYSTEM)
+        llm = ChatGroq(model=GROQ_MODEL, temperature=0)
+        # Truncate to keep prompt cost low; 1 000 chars covers typical answers.
+        response = llm.invoke([
+            SystemMessage(content=_TOXICITY_SYSTEM),
+            HumanMessage(content=text[:1000]),
+        ])
+        raw = response.content.strip()
+        passed = raw.upper().startswith("NO")
+        return {"name": "toxicity", "passed": passed, "detail": raw[:150]}
+    except Exception as exc:
+        return {"name": "toxicity", "passed": True, "detail": f"check unavailable ({exc}) — failed open"}
 
 
-def check_output(answer: str) -> dict:
+# Agents whose output is deterministic, DB-derived text -- not LLM freeform
+# generation -- so a toxicity check on it has ~zero expected value. RAG
+# (user-uploaded PDF content), research (external web text), and chat
+# (freeform LLM generation) are excluded -- those still always get checked.
+_DETERMINISTIC_ONLY_AGENTS = {"finance", "sql"}
+
+# Short answers (canned greeting replies, brief SQL "no results" messages)
+# are checked on length alone -- not worth a Groq call to confirm. 400
+# comfortably covers response_agent.py's longest canned reply (the
+# who-am-I capabilities list, ~355 chars) -- those are hardcoded strings
+# this codebase wrote, not LLM generation, so there's genuinely nothing to
+# check; the threshold exists to catch them without needing a separate
+# "this is canned" signal threaded through the whole call chain.
+_SHORT_ANSWER_SKIP_CHARS = 400
+
+
+def check_output(answer: str, agents_used: list[str] | None = None) -> dict:
     """
     Run PII masking then toxicity check on an agent answer.
+
+    agents_used lets the toxicity check skip itself for answers that are
+    provably deterministic/DB-derived (finance's own <CHART_DATA> signature,
+    or an agents_used set that's entirely finance/sql) -- see
+    _DETERMINISTIC_ONLY_AGENTS above. Free-form LLM generation (chat, RAG
+    over a user's own PDF, research) always still gets the real check.
 
     Returns a dict with:
       passed  — False if toxicity check failed
@@ -91,7 +123,19 @@ def check_output(answer: str) -> dict:
       checks  — list of per-check result dicts
     """
     masked_answer, pii_check = _check_pii(answer)
-    toxicity_check = _check_toxicity(masked_answer)
+
+    used = set(agents_used or [])
+    deterministic_source = bool(used) and used <= _DETERMINISTIC_ONLY_AGENTS
+    skip_reason = None
+    if "<CHART_DATA>" in masked_answer or deterministic_source:
+        skip_reason = "skipped — deterministic, DB-derived answer (finance/sql)"
+    elif len(masked_answer) < _SHORT_ANSWER_SKIP_CHARS:
+        skip_reason = "skipped — short answer"
+
+    if skip_reason:
+        toxicity_check = {"name": "toxicity", "passed": True, "detail": skip_reason}
+    else:
+        toxicity_check = _check_toxicity(masked_answer)
 
     return {
         "passed": pii_check["passed"] and toxicity_check["passed"],

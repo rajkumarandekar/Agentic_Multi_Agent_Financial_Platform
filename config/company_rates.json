@@ -1,0 +1,49 @@
+{
+  "company_name": "TechMart India",
+  "pricing": {
+    "gst_rates": {
+      "Electronics": 18,
+      "Clothing": 5,
+      "Home & Kitchen": 12,
+      "Beauty": 18,
+      "Sports": 12
+    },
+    "margin_targets": {
+      "Electronics": 22,
+      "Clothing": 40,
+      "Home & Kitchen": 30,
+      "Beauty": 35,
+      "Sports": 25
+    }
+  },
+  "discounts": {
+    "bulk_threshold": 50000,
+    "bulk_discount_pct": 8,
+    "loyalty": {
+      "Bronze": 0,
+      "Silver": 5,
+      "Gold": 8,
+      "Platinum": 12
+    },
+    "seasonal_markup_pct": 5,
+    "employee_discount_pct": 20,
+    "coupon_max_pct": 15
+  },
+  "shipping": {
+    "free_above": 999,
+    "flat_rate": 49,
+    "express_rate": 149
+  },
+  "operations": {
+    "return_window_days": 7,
+    "reorder_lead_days": 5
+  },
+  "formulas": {
+    "selling_price": "base_cost * (1 + margin_pct/100) * (1 + gst_rate/100)",
+    "bulk_price": "selling_price * (1 - bulk_discount_pct/100)",
+    "loyalty_price": "selling_price * (1 - loyalty_discount_pct/100)",
+    "final_price": "min(bulk_price, loyalty_price) + shipping",
+    "profit_per_unit": "selling_price - base_cost - (selling_price * gst_rate / (100 + gst_rate))",
+    "customer_lifetime_value": "avg_order_value * purchase_frequency * avg_customer_lifespan"
+  }
+}
