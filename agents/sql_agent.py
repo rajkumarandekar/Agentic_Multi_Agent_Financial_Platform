@@ -27,7 +27,12 @@ logger = logging.getLogger(__name__)
 SQL_MODEL = os.getenv("SQL_MODEL", "llama-3.1-8b-instant")
 DB_PATH   = os.path.join(os.path.dirname(__file__), '..', 'data', 'company.db')
 
-_CUST_RE = re.compile(r'\b(CUST\d+)\b', re.IGNORECASE)
+# Matches CUST002, cust2, and spelled-out "customer 2" / "customer no 2" /
+# "customer number 2" -- real bug this fixes: "customer 2" (no CUST prefix)
+# previously matched nothing, so the id was silently dropped before ever
+# reaching the LLM. Captures just the digits; _extract_entity below builds
+# the zero-padded CUST### form directly from them.
+_CUST_RE = re.compile(r'\bcust(?:omer)?\.?\s*(?:no\.?|number)?\s*0*(\d+)\b', re.IGNORECASE)
 _PRD_RE  = re.compile(r'\b(PRD\d+)\b',  re.IGNORECASE)
 
 _BASE_SYSTEM_PROMPT = """You are a SQL expert for TechMart India.
@@ -35,11 +40,12 @@ _BASE_SYSTEM_PROMPT = """You are a SQL expert for TechMart India.
 Database: data/company.db (SQLite)
 
 Tables and key columns:
-- products: product_id (PRD001-PRD020), product_name, category, base_cost, margin_pct, tax_pct, selling_price, stock_quantity
-- transactions: transaction_id, customer_id (CUST001-CUST010), customer_name, product_id, product_name, category, quantity, unit_price, final_amount, date, month, status
-- customers: customer_id (CUST001-CUST010), customer_name, tier, city, total_spend, total_orders, days_inactive
+- products: product_id (PRD### format), product_name, category, base_cost, margin_pct, tax_pct, selling_price, stock_quantity
+- transactions: transaction_id, customer_id (CUST### format), customer_name, product_id, product_name, category, quantity, unit_price, final_amount, date, month, status
+- customers: customer_id (CUST### format), customer_name, tier, city, total_spend, total_orders, days_inactive, credit_limit, outstanding_balance
 - monthly_sales: month, total_revenue, total_orders, avg_order_value
 - company_rates: rate_name, rate_value
+- loans: loan_id, customer_id, principal, interest_rate, tenure_months, monthly_emi, status, created_at
 
 CRITICAL SQL RULES:
 1. Always filter by ID columns when ID is mentioned:
@@ -68,6 +74,25 @@ CRITICAL SQL RULES:
    word "have". Those name an actual table (products/customers/
    transactions) and must query THAT table directly (see the next example),
    never sqlite_master.
+8. "Last month" / "this month" / "last N months" — use the `month` column
+   (format 'YYYY-MM'), compared with strftime('%Y-%m', ...). NEVER use
+   date('now', '-1 month') against the `date` column for this — date()
+   returns a single SPECIFIC calendar day one month back (e.g. if today is
+   the 27th, that's only the 27th of last month), which matches almost
+   nothing and silently undercounts. "Last month" means the ENTIRE
+   previous calendar month, which the `month` column already encodes
+   directly — see the example below.
+9. "Top N products" / "best products" / "top selling products" with NO
+   metric named — this is ambiguous by itself (top by price? by stock? by
+   sales?), and picking a different column each time you're asked produces
+   a DIFFERENT ranking on every run, which is worse than picking one and
+   being consistent. Default to "best-selling by units actually sold" —
+   join products to transactions and rank by total quantity sold, NOT any
+   single column already sitting in the products table (price, stock,
+   etc. are not "top", they're just sorting an arbitrary field). See the
+   example below. If the question DOES name a metric explicitly ("top 10
+   most expensive", "products with the most stock left"), use that column
+   instead.
 
 EXAMPLE QUERIES:
 "Show CUST007 transactions" →
@@ -91,6 +116,30 @@ products" / "list your products" →
 "How many products" →
   SELECT COUNT(*) as total_products FROM products
 
+"Top 10 products" / "best products" / "top selling products u have" (no
+metric named — defaults to best-selling by units sold, see rule 9) →
+  SELECT p.product_id, p.product_name, p.category,
+         SUM(t.quantity) as units_sold
+  FROM products p JOIN transactions t ON p.product_id = t.product_id
+  WHERE t.status = 'Completed'
+  GROUP BY p.product_id
+  ORDER BY units_sold DESC LIMIT 10
+
+"Top 10 most expensive products" (metric named explicitly -> use it) →
+  SELECT product_id, product_name, category, selling_price
+  FROM products ORDER BY selling_price DESC LIMIT 10
+
+"Top product sold last month" / "best selling product this month" (rules 8
+AND 9 combined — a time filter AND "top" both need applying together, do
+NOT drop either one) →
+  SELECT p.product_id, p.product_name, p.category,
+         SUM(t.quantity) as units_sold
+  FROM products p JOIN transactions t ON p.product_id = t.product_id
+  WHERE t.status = 'Completed'
+    AND t.month = strftime('%Y-%m', 'now', '-1 month')
+  GROUP BY p.product_id
+  ORDER BY units_sold DESC LIMIT 1
+
 "What data do you have" / "show me everything" / "what's in the database" →
   SELECT name FROM sqlite_master WHERE type='table'
 
@@ -102,6 +151,11 @@ products" / "list your products" →
   SELECT customer_id, customer_name, tier, days_inactive
   FROM customers WHERE days_inactive > 60
   ORDER BY days_inactive DESC
+
+"Total transactions last month" / "how many transactions this month" →
+  SELECT COUNT(*) as total_transactions FROM transactions
+  WHERE month = strftime('%Y-%m', 'now', '-1 month')
+  -- for "this month" use strftime('%Y-%m', 'now') with no offset instead
 """
 
 
@@ -126,7 +180,7 @@ def _extract_entity(question: str) -> dict:
     cust = _CUST_RE.search(question)
     prd  = _PRD_RE.search(question)
     return {
-        "customer_id": _normalize_id(cust.group(1), "CUST") if cust else None,
+        "customer_id": f"CUST{int(cust.group(1)):03d}" if cust else None,
         "product_id":  _normalize_id(prd.group(1), "PRD")   if prd  else None,
     }
 
@@ -273,7 +327,12 @@ def run(question: str, messages: list | None = None, entity_question: str | None
     system_prompt = _BASE_SYSTEM_PROMPT + entity_hint
 
     execute_sql_tool = _make_execute_sql(entity)
-    llm = ChatGroq(model=SQL_MODEL, temperature=0)
+    # max_tokens caps the RESERVED completion budget Groq counts toward its
+    # TPM rate limit -- left unset, Groq reserves the model's full max
+    # output allowance regardless of actual answer length, which was
+    # confirmed live to trigger repeated 413 "rate_limit_exceeded" errors
+    # even for short questions/results (see project chat history).
+    llm = ChatGroq(model=SQL_MODEL, temperature=0, max_tokens=1024)
     agent = create_react_agent(
         llm, [execute_sql_tool],
         state_modifier=SystemMessage(content=system_prompt),

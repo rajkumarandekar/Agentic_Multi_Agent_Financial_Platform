@@ -85,6 +85,7 @@ class TestConfirmPurchaseEndToEnd:
         assert await get_pending_interrupt(thread_id) is None
         assert result2["order_confirmed"] is True
         assert "Invoice #" in result2["answer"]
+        assert "Order confirmed and placed" in result2["answer"]
 
     async def test_reject_cancels_without_ever_finalizing(self, monkeypatch):
         thread_id = str(uuid.uuid4())

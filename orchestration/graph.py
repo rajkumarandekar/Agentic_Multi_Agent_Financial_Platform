@@ -8,26 +8,41 @@ Architecture (NOT a linear pipeline):
     │                           │  reads full scratchpad each turn  │
     v                           │  picks exactly one next action    │
   input_guard                   └──────────────────────────────────┘
-    │  (blocked → skip)                  ↑  ↑  ↑  ↑  ↑
-    v                                    │  │  │  │  │
-  supervisor ──sql──────────────────────┘  │  │  │  │
-             ──rag─────────────────────────┘  │  │  │
-             ──finance─────────────────────────┘  │  │
-             ──research────────────────────────────┘  │
-             ──clarify──────────────────────────────────┤
-             ──confirm_purchase────────────────────────────┘
+    │  (blocked → skip)                  ↑  ↑  ↑  ↑  ↑  ↑  ↑  ↑  ↑
+    v                                    │  │  │  │  │  │  │  │  │
+  supervisor ──sql──────────────────────┘  │  │  │  │  │  │  │  │
+             ──rag─────────────────────────┘  │  │  │  │  │  │  │
+             ──finance─────────────────────────┘  │  │  │  │  │
+             ──research────────────────────────────┘  │  │  │  │
+             ──credit───────────────────────────────────┘  │  │
+             ──risk──────────────────────────────────────────┘  │
+             ──forecast────────────────────────────────────────────┘
+             ──clarify──────────────────────────────────────────────┤
+             ──confirm_purchase────────────────────────────────────────┤
+             ──confirm_loan──────────────────────────────────────────────┘
              ──done──> response ──> output_guard ──> END
 
-The six loop-back edges (sql/rag/finance/research/clarify/confirm_purchase →
-supervisor) are what make this multi-agentic: the supervisor sees accumulated
-scratchpad results and decides what to do next on every iteration.
+The nine loop-back edges (sql/rag/finance/research/credit/risk/forecast/
+clarify/confirm_purchase/confirm_loan → supervisor) are what make this
+multi-agentic: the supervisor sees accumulated scratchpad results and
+decides what to do next on every iteration.
 
-confirm_purchase is a SECOND interrupt-based Human-in-the-Loop node (see
-orchestration/confirm.py) — distinct from clarify's "which agent should
-answer this" ambiguity, it gates a CONSEQUENTIAL action (an invoice, i.e.
-an actual order) behind an explicit approve/reject. The supervisor routes
-here (not "done") whenever finance's last result looks like an invoice and
-hasn't been confirmed yet this turn.
+credit/risk/forecast (agents/credit_agent.py, risk_agent.py,
+forecast_agent.py) are Phase 2 additions splitting what used to be finance-
+only concerns (churn prediction, revenue forecasting) into dedicated agents,
+plus genuinely new capability (credit eligibility, EMI, loan proposals,
+fraud/anomaly checks). request_loan (credit_agent) itself calls into
+risk_agent.predict_customer_risk to factor churn signal into a loan
+recommendation — a real cross-agent dependency, not just parallel tools.
+
+confirm_purchase and confirm_loan are SECOND/THIRD interrupt-based
+Human-in-the-Loop nodes (see orchestration/confirm.py,
+orchestration/confirm_loan.py) — distinct from clarify's "which agent
+should answer this" ambiguity, each gates a CONSEQUENTIAL action (an
+invoice / a loan proposal) behind an explicit approve/reject. The
+supervisor routes to whichever one applies (not "done") whenever the
+relevant agent's last result looks like an invoice/proposal and hasn't been
+confirmed yet this turn.
 
 The response node is SEPARATE from the supervisor — it only runs when the
 supervisor emits "done", turning raw scratchpad into a final prose answer.
@@ -50,6 +65,7 @@ from orchestration.state import AgentState
 from orchestration.supervisor import _route, supervisor_node
 from orchestration.clarify import clarify_node
 from orchestration.confirm import confirm_purchase_node
+from orchestration.confirm_loan import confirm_loan_node
 
 load_dotenv()
 
@@ -196,6 +212,39 @@ async def research_node(state: AgentState) -> dict:
     }
 
 
+async def credit_node(state: AgentState) -> dict:
+    """Credit eligibility, EMI, and loan proposals."""
+    from agents.credit_agent import run
+    trace_agent_start("CREDIT", state["question"])
+    result = await run(question=_contextual_question(state), messages=state.get("messages", []))
+    return {
+        "scratchpad":  state.get("scratchpad", []) + [{"agent": "credit", "result": result}],
+        "agents_used": state.get("agents_used", []) + ["credit"],
+    }
+
+
+async def risk_node(state: AgentState) -> dict:
+    """Churn/retention risk and transaction fraud/anomaly checks."""
+    from agents.risk_agent import run
+    trace_agent_start("RISK", state["question"])
+    result = await run(question=_contextual_question(state), messages=state.get("messages", []))
+    return {
+        "scratchpad":  state.get("scratchpad", []) + [{"agent": "risk", "result": result}],
+        "agents_used": state.get("agents_used", []) + ["risk"],
+    }
+
+
+async def forecast_node(state: AgentState) -> dict:
+    """Flexible day/week/month/year revenue forecasting."""
+    from agents.forecast_agent import run
+    trace_agent_start("FORECAST", state["question"])
+    result = await run(question=_contextual_question(state), messages=state.get("messages", []))
+    return {
+        "scratchpad":  state.get("scratchpad", []) + [{"agent": "forecast", "result": result}],
+        "agents_used": state.get("agents_used", []) + ["forecast"],
+    }
+
+
 async def response_node(state: AgentState) -> dict:
     """
     Fuse the accumulated scratchpad into one clean prose answer.
@@ -223,10 +272,17 @@ async def response_node(state: AgentState) -> dict:
 
     # Derive a human-readable agent label for the API response
     agents = state.get("agents_used", [])
-    if len([a for a in agents if a in {"sql", "rag", "finance", "research"}]) > 1:
+    _primary = {"sql", "rag", "finance", "credit", "risk", "forecast", "research"}
+    if len([a for a in agents if a in _primary]) > 1:
         agent_label = "synthesis"
     elif "finance" in agents:
         agent_label = "finance"
+    elif "credit" in agents:
+        agent_label = "credit"
+    elif "risk" in agents:
+        agent_label = "risk"
+    elif "forecast" in agents:
+        agent_label = "forecast"
     elif "rag" in agents:
         agent_label = "rag"
     elif "sql" in agents:
@@ -266,10 +322,14 @@ def _build_wiring() -> StateGraph:
     builder.add_node("supervisor",       supervisor_node)
     builder.add_node("clarify",          clarify_node)
     builder.add_node("confirm_purchase", confirm_purchase_node)
+    builder.add_node("confirm_loan",     confirm_loan_node)
     builder.add_node("sql",          sql_node)
     builder.add_node("rag",          rag_node)
     builder.add_node("finance",      finance_node)
     builder.add_node("research",     research_node)
+    builder.add_node("credit",       credit_node)
+    builder.add_node("risk",         risk_node)
+    builder.add_node("forecast",     forecast_node)
     builder.add_node("response",     response_node)
     builder.add_node("output_guard", output_guard_node)
 
@@ -288,8 +348,12 @@ def _build_wiring() -> StateGraph:
         "rag":      "rag",
         "finance":  "finance",
         "research": "research",
+        "credit":   "credit",
+        "risk":     "risk",
+        "forecast": "forecast",
         "clarify":  "clarify",
         "confirm_purchase": "confirm_purchase",
+        "confirm_loan":     "confirm_loan",
         "done":     "response",       # only exit from the supervisor loop
         # "unclear" — a genuinely ambiguous question with a preset canned
         # answer already in state["answer"] (set by supervisor_node). Skips
@@ -307,8 +371,12 @@ def _build_wiring() -> StateGraph:
     builder.add_edge("rag",      "supervisor")   # ← loop back
     builder.add_edge("finance",  "supervisor")   # ← loop back
     builder.add_edge("research", "supervisor")   # ← loop back
+    builder.add_edge("credit",   "supervisor")   # ← loop back
+    builder.add_edge("risk",     "supervisor")   # ← loop back
+    builder.add_edge("forecast", "supervisor")   # ← loop back
     builder.add_edge("clarify",  "supervisor")   # ← loop back (after user answers)
     builder.add_edge("confirm_purchase", "supervisor")  # ← loop back (after approve/reject)
+    builder.add_edge("confirm_loan",     "supervisor")  # ← loop back (after approve/reject)
 
     # ── Terminal path — runs only once, after supervisor emits "done" ─────────
     builder.add_edge("response",     "output_guard")
@@ -376,15 +444,16 @@ async def _pending_interrupt_task(thread_id: str):
     """
     The PregelTask currently paused on an interrupt for this thread, or None.
 
-    Neither clarify_node's nor confirm_purchase_node's interrupt() call
-    surfaces via graph.ainvoke()'s return value in this LangGraph version —
-    invoke just returns the state as of the last completed node, unchanged.
-    The only way to detect a pause is graph.aget_state(): a non-empty
-    `.next` means the graph stopped mid-turn with unresolved tasks, and the
-    paused task's `.interrupts` holds the Interrupt object whose `.value` is
-    whatever text that node passed to interrupt(); `.name` is the node name
-    ("clarify" or "confirm_purchase"), used by api/main.py to label the
-    paused response with the right agent_used.
+    None of clarify_node's, confirm_purchase_node's, or confirm_loan_node's
+    interrupt() calls surface via graph.ainvoke()'s return value in this
+    LangGraph version — invoke just returns the state as of the last
+    completed node, unchanged. The only way to detect a pause is
+    graph.aget_state(): a non-empty `.next` means the graph stopped mid-turn
+    with unresolved tasks, and the paused task's `.interrupts` holds the
+    Interrupt object whose `.value` is whatever text that node passed to
+    interrupt(); `.name` is the node name ("clarify", "confirm_purchase", or
+    "confirm_loan"), used by api/main.py to label the paused response with
+    the right agent_used.
 
     Safe to call for a thread_id the checkpointer has never seen — returns
     an empty snapshot (next=(), tasks=()), not an error.

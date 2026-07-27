@@ -2,9 +2,17 @@
 train_models.py — Train all ML models for the TechMart India finance agent.
 
 Trains in sequence:
-  4A — ARIMA sales forecast (pmdarima.auto_arima, fallback: statsmodels ARIMA(1,1,1))
+  4A — ARIMA monthly sales forecast (pmdarima.auto_arima, fallback: statsmodels ARIMA(1,1,1))
   4B — Customer churn classifier (RandomForest + LeaveOneOut CV)
   4C — Product demand forecasting (LinearRegression per product)
+
+The Forecast agent's flexible day/week/month/year horizon (agents/forecast_agent.py)
+is derived from THIS SAME monthly model by scaling, not a second model trained at
+finer granularity: a first attempt at a separate daily/weekly ARIMA produced a
+111-263% test MAPE (the synthetic data is generated per-calendar-month, so day/week
+boundaries don't align with where its real signal lives) -- worse than useless.
+Deriving finer granularity from the one model that's actually well-fit, with wider
+uncertainty bands the finer the requested unit, is both simpler and more honest.
 
 Saves 7 files to models/:
   sales_forecast.pkl, forecast_metrics.json
@@ -101,7 +109,7 @@ def train_arima() -> dict:
     print(f"  MAPE: {mape:.1f}%")
     print(f"  RMSE: Rs.{rmse:,.0f}")
 
-    # Retrain on ALL 18 months for production
+    # Retrain on ALL months of data for production
     try:
         import pmdarima as pm
         _raw_full = pm.auto_arima(
@@ -131,7 +139,7 @@ def train_arima() -> dict:
         "mape":        round(mape, 2),
         "rmse":        round(rmse, 2),
         "best_order":  list(best_order),
-        "train_months": 18,
+        "train_months": len(revenue),
         "last_month":  months[-1],
     }
     json.dump(metrics, open(metrics_path, "w"), indent=2)
@@ -192,10 +200,17 @@ def train_churn() -> dict:
 
     feat_df["churn_label"] = feat_df.apply(_label, axis=1)
 
+    # days_inactive/return_rate are excluded from the FEATURE set on purpose:
+    # they're exactly what _label() thresholds on to assign the label, so
+    # feeding them back in as inputs lets the model trivially re-derive the
+    # rule instead of predicting anything (LOO accuracy was 98.8% with them
+    # included -- pure label leakage, not a real result). Leaving only
+    # behavioral/purchase-pattern columns makes this a genuine prediction:
+    # can spending behavior alone forecast the risk tier before a customer
+    # actually goes quiet or starts returning items.
     feature_cols = [
         "total_spend", "order_count", "avg_order_value",
-        "days_inactive", "return_rate", "unique_categories",
-        "unique_products", "avg_quantity",
+        "unique_categories", "unique_products", "avg_quantity",
     ]
 
     print("\n  Feature matrix:")
@@ -225,7 +240,7 @@ def train_churn() -> dict:
     accuracy = float(np.mean(np.array(loo_preds) == y))
     print(f"  LOO cross-val accuracy: {accuracy * 100:.0f}%")
 
-    # Final model on all 10 customers
+    # Final model on all customers
     clf = RandomForestClassifier(n_estimators=100, random_state=42)
     clf.fit(X, y)
 

@@ -176,6 +176,128 @@ class AgentResponse(BaseModel):
     followup: str | None = None
 
 
+async def _build_graph_input(body: "AgentRequest", session_id: str, request_id: str):
+    """
+    Build the input for this turn's graph invocation: either a Command(resume=...)
+    if a prior interrupt is still pending, or a fresh initial state dict.
+
+    Shared by agent_endpoint() and agent_stream_endpoint() so the HITL-resume
+    logic, PDF-selection handling, and chat-history seeding only exist once.
+    Returns (graph_input, graph_config).
+    """
+    graph_config = {
+        "configurable": {"thread_id": session_id},
+        # LangSmith UI: run_name shows up as the trace's title (instead of a
+        # generic "LangGraph"); tags/metadata make a session's requests
+        # filterable/searchable there instead of needing a custom dashboard.
+        "run_name": body.question[:80],
+        "tags": [f"session:{session_id}"],
+        "metadata": {"session_id": session_id, "request_id": request_id},
+    }
+
+    # ── Human-in-the-loop: resume a paused clarify() interrupt ────────────────
+    # If the supervisor routed to "clarify" on a PRIOR turn, orchestration/
+    # clarify.py's interrupt() paused the graph mid-turn and the last response
+    # already surfaced the clarifying question to the user (see the pause
+    # check below). This turn's body.question is the user's answer to that
+    # question, not a new question -- resume the paused graph with it instead
+    # of starting a fresh turn. graph.ainvoke() never raises/returns an
+    # "interrupted" marker in this LangGraph version; aget_state() is the only
+    # way to detect a pause (see get_pending_interrupt's docstring).
+    resuming = await get_pending_interrupt(session_id) is not None
+    if resuming:
+        # A paused clarify() interrupt already has all the state it needs
+        # (the original question, scratchpad, etc.) checkpointed from before
+        # the pause -- nothing to rebuild, just supply the resume value.
+        return Command(resume=body.question), graph_config
+
+    # Build initial state.  Fields listed here OVERWRITE the MemorySaver checkpoint.
+    # source_document is deliberately omitted when the client sends None so that
+    # MemorySaver keeps the previous value — the document stays "selected" across
+    # turns without the frontend re-sending it every request.
+    #
+    # scratchpad and agents_used use the `add` reducer, so setting them to []
+    # here resets them for each new request (old values were from the prior turn).
+    # Treat missing, empty-string, and "None" all as no document selected.
+    # Always write source_document so it overwrites the MemorySaver checkpoint —
+    # without this, deselecting a PDF in the UI has no effect on routing.
+    _source_doc = body.source_document if (
+        body.source_document and str(body.source_document).strip() not in ("", "None")
+    ) else None
+
+    # Seed `messages` from the SQLite chat history ONLY when the checkpointer has
+    # never seen this thread_id — e.g. an old chat reopened after checkpoints.db
+    # was cleared, or a chat created before this session's server process started.
+    # A thread with an existing checkpoint already carries its full history via
+    # the `add_messages` reducer; re-seeding it every turn would re-append the
+    # same messages under new ids indefinitely and blow up the context.
+    turn_messages: list = [HumanMessage(content=body.question)]
+    if not await has_checkpoint(session_id):
+        chat = _cs_get(session_id)
+        if chat and chat.get("messages"):
+            prior: list = []
+            for m in chat["messages"][-6:]:  # matches the n=6 window used everywhere else
+                # Truncate like _build_history/_contextual_question do — a long
+                # answer full of markdown tables shouldn't dominate the prompt.
+                if m["role"] == "user":
+                    prior.append(HumanMessage(content=m["text"][:300]))
+                elif m["role"] == "assistant":
+                    prior.append(AIMessage(content=m["text"][:300]))
+            turn_messages = prior + turn_messages
+            logger.info(
+                "history_seeded",
+                extra={"request_id": request_id, "session_id": session_id,
+                       "prior_messages": len(prior)},
+            )
+
+    graph_input = {
+        "question":          body.question,
+        "messages":          turn_messages,
+        "scratchpad":        [],        # always reset — clears stale agent results
+        "route":             "",
+        "answer":            "",
+        "sources":           [],
+        "agent_used":        "",
+        "agents_used":       [],
+        "iteration_count":   0,         # always reset — prevents supervisor seeing old count
+        "source_document":   _source_doc,
+        "clarified_source":  None,
+        "order_confirmed":   False,     # always reset — only needs to survive within one turn's loop
+        "loan_confirmed":    False,     # same reset rule, for confirm_loan_node
+        "guardrail_results": {},
+        "knowledge_result":  {},
+        "finance_result":    "",
+        "plan":              {},
+        # "pending_followup" deliberately NOT set here -- omitting it lets
+        # the checkpointed value from the PRIOR turn's response_node
+        # survive into this turn's supervisor routing decision (see
+        # orchestration/state.py). response_node overwrites it again at
+        # the end of this turn regardless, so it always reflects "the
+        # follow-up suggested by the most recent answer."
+    }
+    return graph_input, graph_config
+
+
+def _agent_response_from_result(result: dict, session_id: str, agent_used: str) -> "AgentResponse":
+    """Build the final AgentResponse from a completed graph result dict.
+    Shared by agent_endpoint() and agent_stream_endpoint()."""
+    return AgentResponse(
+        agent_used=agent_used,
+        answer=result["answer"],
+        sources=[SourceItem(**s) for s in result.get("sources", [])],
+        guardrails=result.get("guardrail_results", {}),
+        session_id=session_id,
+        agents_used=result.get("agents_used", []),
+        # chat = greeting/chitchat (empty scratchpad); plan = agent(s) ran
+        mode="chat" if not result.get("scratchpad") else "plan",
+        # Read from state, not recomputed here — response_node already
+        # computed this (see orchestration/graph.py) and wrote it into
+        # pending_followup, which is the same value next turn's supervisor
+        # routing reads. Recomputing here would risk the two ever drifting.
+        followup=result.get("pending_followup"),
+    )
+
+
 @app.post("/agent", response_model=AgentResponse)
 async def agent_endpoint(body: AgentRequest) -> AgentResponse:
     """
@@ -205,95 +327,7 @@ async def agent_endpoint(body: AgentRequest) -> AgentResponse:
                                          "session_id": session_id,
                                          "question": body.question[:80]})
 
-    graph_config = {
-        "configurable": {"thread_id": session_id},
-        # LangSmith UI: run_name shows up as the trace's title (instead of a
-        # generic "LangGraph"); tags/metadata make a session's requests
-        # filterable/searchable there instead of needing a custom dashboard.
-        "run_name": body.question[:80],
-        "tags": [f"session:{session_id}"],
-        "metadata": {"session_id": session_id, "request_id": request_id},
-    }
-
-    # ── Human-in-the-loop: resume a paused clarify() interrupt ────────────────
-    # If the supervisor routed to "clarify" on a PRIOR turn, orchestration/
-    # clarify.py's interrupt() paused the graph mid-turn and the last response
-    # already surfaced the clarifying question to the user (see the pause
-    # check below). This turn's body.question is the user's answer to that
-    # question, not a new question -- resume the paused graph with it instead
-    # of starting a fresh turn. graph.ainvoke() never raises/returns an
-    # "interrupted" marker in this LangGraph version; aget_state() is the only
-    # way to detect a pause (see get_pending_interrupt's docstring).
-    resuming = await get_pending_interrupt(session_id) is not None
-    if resuming:
-        # A paused clarify() interrupt already has all the state it needs
-        # (the original question, scratchpad, etc.) checkpointed from before
-        # the pause -- nothing to rebuild, just supply the resume value.
-        graph_input = Command(resume=body.question)
-    else:
-        # Build initial state.  Fields listed here OVERWRITE the MemorySaver checkpoint.
-        # source_document is deliberately omitted when the client sends None so that
-        # MemorySaver keeps the previous value — the document stays "selected" across
-        # turns without the frontend re-sending it every request.
-        #
-        # scratchpad and agents_used use the `add` reducer, so setting them to []
-        # here resets them for each new request (old values were from the prior turn).
-        # Treat missing, empty-string, and "None" all as no document selected.
-        # Always write source_document so it overwrites the MemorySaver checkpoint —
-        # without this, deselecting a PDF in the UI has no effect on routing.
-        _source_doc = body.source_document if (
-            body.source_document and str(body.source_document).strip() not in ("", "None")
-        ) else None
-
-        # Seed `messages` from the SQLite chat history ONLY when the checkpointer has
-        # never seen this thread_id — e.g. an old chat reopened after checkpoints.db
-        # was cleared, or a chat created before this session's server process started.
-        # A thread with an existing checkpoint already carries its full history via
-        # the `add_messages` reducer; re-seeding it every turn would re-append the
-        # same messages under new ids indefinitely and blow up the context.
-        turn_messages: list = [HumanMessage(content=body.question)]
-        if not await has_checkpoint(session_id):
-            chat = _cs_get(session_id)
-            if chat and chat.get("messages"):
-                prior: list = []
-                for m in chat["messages"][-6:]:  # matches the n=6 window used everywhere else
-                    # Truncate like _build_history/_contextual_question do — a long
-                    # answer full of markdown tables shouldn't dominate the prompt.
-                    if m["role"] == "user":
-                        prior.append(HumanMessage(content=m["text"][:300]))
-                    elif m["role"] == "assistant":
-                        prior.append(AIMessage(content=m["text"][:300]))
-                turn_messages = prior + turn_messages
-                logger.info(
-                    "history_seeded",
-                    extra={"request_id": request_id, "session_id": session_id,
-                           "prior_messages": len(prior)},
-                )
-
-        graph_input = {
-            "question":          body.question,
-            "messages":          turn_messages,
-            "scratchpad":        [],        # always reset — clears stale agent results
-            "route":             "",
-            "answer":            "",
-            "sources":           [],
-            "agent_used":        "",
-            "agents_used":       [],
-            "iteration_count":   0,         # always reset — prevents supervisor seeing old count
-            "source_document":   _source_doc,
-            "clarified_source":  None,
-            "order_confirmed":   False,     # always reset — only needs to survive within one turn's loop
-            "guardrail_results": {},
-            "knowledge_result":  {},
-            "finance_result":    "",
-            "plan":              {},
-            # "pending_followup" deliberately NOT set here -- omitting it lets
-            # the checkpointed value from the PRIOR turn's response_node
-            # survive into this turn's supervisor routing decision (see
-            # orchestration/state.py). response_node overwrites it again at
-            # the end of this turn regardless, so it always reflects "the
-            # follow-up suggested by the most recent answer."
-        }
+    graph_input, graph_config = await _build_graph_input(body, session_id, request_id)
 
     try:
         result = await graph.ainvoke(graph_input, config=graph_config)
@@ -314,10 +348,9 @@ async def agent_endpoint(body: AgentRequest) -> AgentResponse:
     # result["answer"] is stale here if so (still "" from graph_input, or the
     # previous turn's answer when resuming) -- the paused node stopped before
     # ever reaching response_node, so surface its prompt directly instead of
-    # falling through to the normal result-shaped response below. Two
+    # falling through to the normal result-shaped response below. Multiple
     # different nodes can pause here (see orchestration/graph.py's module
-    # docstring): "clarify" (which agent should answer this) and
-    # "confirm_purchase" (should this invoice actually be placed) --
+    # docstring): "clarify", "confirm_purchase", "confirm_loan" --
     # get_pending_interrupt_node() says which, so the response is labeled
     # correctly instead of always saying "clarify".
     pending_prompt = await get_pending_interrupt(session_id)
@@ -348,65 +381,144 @@ async def agent_endpoint(body: AgentRequest) -> AgentResponse:
         },
     )
 
-    return AgentResponse(
-        agent_used=agent_used,
-        answer=result["answer"],
-        sources=[SourceItem(**s) for s in result.get("sources", [])],
-        guardrails=result.get("guardrail_results", {}),
-        session_id=session_id,
-        agents_used=result.get("agents_used", []),
-        # chat = greeting/chitchat (empty scratchpad); plan = agent(s) ran
-        mode="chat" if not result.get("scratchpad") else "plan",
-        # Read from state, not recomputed here — response_node already
-        # computed this (see orchestration/graph.py) and wrote it into
-        # pending_followup, which is the same value next turn's supervisor
-        # routing reads. Recomputing here would risk the two ever drifting.
-        followup=result.get("pending_followup"),
-    )
+    return _agent_response_from_result(result, session_id, agent_used)
 
 
 # Word-level chunk, keeping trailing whitespace attached so words don't
 # visually collide when the frontend appends chunks back-to-back.
 _WORD_RE = re.compile(r'\S+\s*')
 
+# Human-readable label per graph node, shown live in the UI's loading state
+# as each node actually completes (see agent_stream_endpoint's "status"
+# events below) — names match orchestration/graph.py's registered node
+# names exactly, since that's the dict key graph.astream(stream_mode=
+# "updates") yields per completed step.
+_NODE_LABELS = {
+    "input_guard":      "Checking your request",
+    "supervisor":       "Routing to the right specialist",
+    "sql":              "SQL Agent — querying data",
+    "rag":              "RAG Agent — searching documents",
+    "finance":          "Finance Agent — calculating",
+    "credit":           "Credit Agent — evaluating",
+    "risk":             "Risk Agent — analyzing",
+    "forecast":         "Forecast Agent — predicting",
+    "research":         "Research Agent — searching the web",
+    "clarify":          "Waiting for clarification",
+    "confirm_purchase": "Awaiting order approval",
+    "confirm_loan":     "Awaiting loan approval",
+    "response":         "Composing your answer",
+    "output_guard":     "Finalizing response",
+}
+
 
 @app.post("/agent/stream")
 async def agent_stream_endpoint(body: AgentRequest) -> StreamingResponse:
     """
-    Same pipeline as /agent — same guardrails, HITL, routing, memory — with
-    ZERO duplicated logic: this calls agent_endpoint() directly (a plain
-    async function call, not a second HTTP round-trip) and streams its
-    already-fully-guarded AgentResponse back as Server-Sent Events, split
-    into one event per word.
+    Same pipeline as /agent — same guardrails, HITL, routing, memory --
+    driven directly via graph.astream(stream_mode="updates") instead of
+    calling agent_endpoint() so this can emit a "status" event as EACH node
+    genuinely completes, in real time. Real gap this closes: the previous
+    version awaited the ENTIRE agent_endpoint() call first and only then
+    started streaming its already-finished answer -- there was no way for
+    the UI to know which of the 7 agents was actually running while the
+    request was in flight, only a blind spinner. graph_input/graph_config
+    construction and final-response shaping are shared with agent_endpoint()
+    via _build_graph_input()/_agent_response_from_result() so neither this
+    nor that endpoint duplicates the HITL-resume/history-seeding logic.
 
-    Critically, output_guard has ALREADY run and approved the complete
-    answer before this function ever sees it — streaming happens strictly
-    AFTER guarding, never instead of it. If output_guard would have blocked
-    or masked something, that already happened inside agent_endpoint();
-    this endpoint only ever chunks up text that was already safe to return
-    as a single response.
+    Critically, output_guard is one of the nodes this streams through, so
+    its "status" event fires before the final answer is ever sent -- by the
+    time the "meta"/"chunk"/"done" events go out below, output_guard has
+    already run and approved the complete answer, same guarantee as before.
 
-    No artificial per-chunk delay here on purpose: verified live that the
-    browser's fetch/ReadableStream reader can deliver an entire multi-KB SSE
-    response in a SINGLE `read()` regardless of how granularly the server
-    flushes (confirmed directly -- a 130-chunk response server-flushed
-    ~12ms apart still arrived as one browser-side read). Network-level
-    pacing is therefore not reliably observable client-side at all, so the
-    typing-effect pacing is done entirely in the frontend instead (see
-    api.js's sendMessageStream -- it queues incoming words and reveals them
-    on its own timer, decoupled from how the browser batches the underlying
-    reads). This endpoint's only job is to hand over the words in order.
+    No artificial per-chunk delay on the word-chunk events, same rationale
+    as before: verified live that the browser's fetch/ReadableStream reader
+    can deliver an entire multi-KB SSE response in a single `read()`
+    regardless of server flush granularity, so pacing is done client-side.
 
-    Event stream shape (three event types, in order):
+    Event stream shape:
+      event: status — {"agent": "<node_name>", "label": "<human label>"} --
+                       one per graph node as it completes, BEFORE the final
+                       answer is ready. Lets the UI show live progress
+                       ("Credit Agent — evaluating...") instead of a blind
+                       spinner.
       event: meta   — everything from AgentResponse except `answer` (badges,
-                      sources, followup, session_id, etc.) — sent first so
-                      the UI can render the message shell immediately.
+                      sources, followup, session_id, etc.) — sent once the
+                      run is fully done, before the answer text itself.
       event: chunk  — {"text": "<word> "} — one per word of the answer.
       event: done   — stream complete, no further events follow.
+      event: error  — {"detail": "..."} — something failed mid-run. An SSE
+                      event, not an HTTP error status, since a 200 with the
+                      SSE content-type has already gone out by the time a
+                      graph error could happen.
     """
-    response: AgentResponse = await agent_endpoint(body)
+    session_id = body.session_id or str(uuid.uuid4())
+    request_id = new_request_id()
+    t_start = time.perf_counter()
+
+    logger.info("request_start", extra={"request_id": request_id,
+                                         "session_id": session_id,
+                                         "question": body.question[:80]})
+
+    graph_input, graph_config = await _build_graph_input(body, session_id, request_id)
 
     async def _event_stream():
+        try:
+            async for update in graph.astream(graph_input, config=graph_config, stream_mode="updates"):
+                for node_name in update.keys():
+                    # "__interrupt__" is LangGraph's own internal bookkeeping
+                    # key for a pause, not a real node -- the pause itself is
+                    # reported properly below via get_pending_interrupt_node().
+                    if node_name.startswith("__"):
+                        continue
+                    label = _NODE_LABELS.get(node_name, node_name)
+                    yield f"event: status\ndata: {json.dumps({'agent': node_name, 'label': label})}\n\n"
+        except Exception as exc:
+            total_ms = (time.perf_counter() - t_start) * 1000
+            logger.error(
+                "request_failed",
+                extra={"request_id": request_id, "total_ms": round(total_ms, 1),
+                       "error": str(exc)},
+            )
+            logger.debug("traceback:\n%s", traceback.format_exc())
+            detail = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            yield f"event: error\ndata: {json.dumps({'detail': detail})}\n\n"
+            return
+
+        total_ms = (time.perf_counter() - t_start) * 1000
+
+        # ── Human-in-the-loop: did this run pause on a NEW interrupt? ─────────
+        # Same detection as agent_endpoint() -- see get_pending_interrupt's
+        # docstring for why aget_state() is the only way to tell.
+        pending_prompt = await get_pending_interrupt(session_id)
+        if pending_prompt is not None:
+            pending_node = await get_pending_interrupt_node(session_id) or "clarify"
+            logger.info("request_paused_for_hitl",
+                        extra={"request_id": request_id, "session_id": session_id,
+                               "pending_node": pending_node})
+            meta = {
+                "agent_used": pending_node, "sources": [], "guardrails": {},
+                "session_id": session_id, "agents_used": [], "mode": pending_node,
+                "followup": None,
+            }
+            yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
+            for word in _WORD_RE.findall(pending_prompt):
+                yield f"event: chunk\ndata: {json.dumps({'text': word})}\n\n"
+            yield "event: done\ndata: {}\n\n"
+            return
+
+        # ── Normal completion — fetch the final state and stream the answer ───
+        snapshot   = await graph.aget_state(graph_config)
+        result     = snapshot.values
+        agent_used = result.get("agent_used", "unknown")
+
+        logger.info(
+            "request_done",
+            extra={"request_id": request_id, "agent_used": agent_used,
+                   "total_ms": round(total_ms, 1)},
+        )
+
+        response = _agent_response_from_result(result, session_id, agent_used)
         meta = response.model_dump()
         answer_text = meta.pop("answer")
         yield f"event: meta\ndata: {json.dumps(meta)}\n\n"

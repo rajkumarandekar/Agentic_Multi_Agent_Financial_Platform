@@ -54,17 +54,31 @@ CREATE TABLE transactions (
 );
 
 CREATE TABLE customers (
-    customer_id     TEXT PRIMARY KEY,
-    customer_name   TEXT NOT NULL,
-    email           TEXT,
-    phone           TEXT,
-    city            TEXT,
-    tier            TEXT DEFAULT 'Bronze',
-    join_date       TEXT,
-    last_purchase   TEXT,
-    total_spend     REAL DEFAULT 0,
-    total_orders    INTEGER DEFAULT 0,
-    days_inactive   INTEGER DEFAULT 0
+    customer_id         TEXT PRIMARY KEY,
+    customer_name       TEXT NOT NULL,
+    email               TEXT,
+    phone               TEXT,
+    city                TEXT,
+    tier                TEXT DEFAULT 'Bronze',
+    join_date           TEXT,
+    last_purchase       TEXT,
+    total_spend         REAL DEFAULT 0,
+    total_orders        INTEGER DEFAULT 0,
+    days_inactive       INTEGER DEFAULT 0,
+    credit_limit        REAL DEFAULT 0,
+    outstanding_balance  REAL DEFAULT 0
+);
+
+CREATE TABLE loans (
+    loan_id         TEXT PRIMARY KEY,
+    customer_id     TEXT NOT NULL,
+    principal       REAL NOT NULL,
+    interest_rate   REAL NOT NULL,
+    tenure_months   INTEGER NOT NULL,
+    monthly_emi     REAL NOT NULL,
+    status          TEXT DEFAULT 'Pending',
+    created_at      TEXT NOT NULL,
+    FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
 );
 
 CREATE TABLE monthly_sales (
@@ -85,11 +99,12 @@ CREATE TABLE company_rates (
 """
 
 _EXPECTED = {
-    "products":      20,
-    "transactions": 550,  # may vary slightly — just check > 0
-    "customers":     10,
-    "monthly_sales": 18,
-    "company_rates": 15,
+    "products":       100,  # 20 original + ~120 new — check > 0, not exact
+    "transactions":  4000,  # ~3.5 years of transactions — may vary slightly
+    "customers":      200,  # 10 original + ~240 new
+    "monthly_sales":   36,  # 43-month window, minus any zero-transaction months
+    "company_rates":   15,
+    "loans":           20,
 }
 
 
@@ -97,7 +112,7 @@ def _read_excel() -> dict[str, pd.DataFrame]:
     print(f"Reading {XLSX} ...")
     xl = pd.ExcelFile(XLSX)
     sheets = {}
-    for name in ["products", "transactions", "monthly_sales", "customers", "company_rates"]:
+    for name in ["products", "transactions", "monthly_sales", "customers", "company_rates", "loans"]:
         df = xl.parse(name)
         sheets[name] = df
         print(f"  {name}: {len(df)} rows x {len(df.columns)} cols")
@@ -111,6 +126,7 @@ def _coerce_types(sheets: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         "transactions":  ["quantity"],
         "customers":     ["total_orders", "days_inactive"],
         "monthly_sales": ["total_orders", "unique_customers", "returns_count"],
+        "loans":         ["tenure_months"],
     }
     for table, cols in int_cols.items():
         for col in cols:
@@ -145,8 +161,8 @@ def _create_db(sheets: dict[str, pd.DataFrame]) -> None:
     conn.commit()
     print("Schema created.")
 
-    # Insert data (foreign-key order: products and customers before transactions)
-    load_order = ["products", "customers", "transactions", "monthly_sales", "company_rates"]
+    # Insert data (foreign-key order: products and customers before transactions/loans)
+    load_order = ["products", "customers", "transactions", "monthly_sales", "company_rates", "loans"]
     for table in load_order:
         df = sheets[table]
         df.to_sql(table, conn, if_exists="append", index=False)
@@ -168,7 +184,7 @@ def main() -> None:
     # Final verification count
     conn = sqlite3.connect(DB_PATH)
     print("\n=== DATABASE SETUP COMPLETE ===")
-    for table in ["products", "transactions", "customers", "monthly_sales", "company_rates"]:
+    for table in ["products", "transactions", "customers", "monthly_sales", "company_rates", "loans"]:
         n = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         print(f"  {table}: {n} rows")
     conn.close()

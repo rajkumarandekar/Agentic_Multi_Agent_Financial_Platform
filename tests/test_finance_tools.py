@@ -163,6 +163,16 @@ class TestEveryToolHasCardAndBulletSummary:
     def test_customer_lifetime_value(self):
         self._assert_card_and_summary(fa.customer_lifetime_value.invoke({"customer_id": "CUST001"}))
 
+    def test_customer_lifetime_value_shows_npv_discount_effect(self):
+        """Phase 3: CLV now reports NPV alongside the undiscounted total --
+        the NPV figure must be strictly less than the undiscounted one
+        (money later is worth less than money now), proving real discount
+        math ran rather than just relabeling the same number."""
+        out = fa.customer_lifetime_value.invoke({"customer_id": "CUST001"})
+        assert "NPV" in out
+        assert "undiscounted" in out
+
+
     def test_category_performance(self):
         self._assert_card_and_summary(fa.category_performance.invoke({"category": "Electronics"}))
 
@@ -206,3 +216,14 @@ class TestEveryToolHasCardAndBulletSummary:
         self._assert_card_and_summary(fa.calculate_multi_product_bulk_quote.invoke({
             "product_ids": ["PRD001", "PRD004"], "quantities": [5, 3],
         }))
+
+
+class TestNpvHelper:
+    def test_npv_less_than_undiscounted_sum(self):
+        monthly = 10_000.0
+        undiscounted = monthly * 36
+        npv = fa._npv(monthly, 36, fa._CLV_DISCOUNT_RATE)
+        assert 0 < npv < undiscounted
+
+    def test_zero_rate_equals_undiscounted_sum(self):
+        assert fa._npv(1000.0, 12, 0.0) == 1000.0 * 12

@@ -38,6 +38,16 @@
     "return_window_days": 7,
     "reorder_lead_days": 5
   },
+  "loans": {
+    "interest_rate_by_tier": {
+      "Bronze": 18.0,
+      "Silver": 15.0,
+      "Gold": 12.0,
+      "Platinum": 10.0
+    },
+    "min_tenure_months": 3,
+    "max_tenure_months": 60
+  },
   "formulas": {
     "selling_price": "base_cost * (1 + margin_pct/100) * (1 + gst_rate/100)",
     "bulk_price": "selling_price * (1 - bulk_discount_pct/100)",

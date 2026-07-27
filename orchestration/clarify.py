@@ -51,7 +51,9 @@ def clarify_node(state: AgentState) -> dict:
 
     # Generate a targeted clarifying question
     try:
-        llm = ChatGroq(model=_MODEL, temperature=0.3)
+        # max_tokens caps the RESERVED completion budget Groq counts toward
+        # its TPM rate limit -- see agents/sql_agent.py's identical comment.
+        llm = ChatGroq(model=_MODEL, temperature=0.3, max_tokens=256)
         resp = llm.invoke([
             SystemMessage(content=_CLARIFY_SYSTEM),
             HumanMessage(

@@ -54,9 +54,15 @@ const BADGE_CONFIG = {
   rag:       { bg: '#6366f1', label: 'RAG' },
   sql:       { bg: '#10b981', label: 'SQL' },
   tool:      { bg: '#f59e0b', label: 'TOOL' },
+  finance:   { bg: '#0d9488', label: 'FINANCE' },
+  credit:    { bg: '#2563eb', label: '💳 CREDIT' },
+  risk:      { bg: '#dc2626', label: '⚠️ RISK' },
+  forecast:  { bg: '#7c3aed', label: '📈 FORECAST' },
+  research:  { bg: '#0891b2', label: '🔎 RESEARCH' },
   chat:      { bg: '#6b7280', label: 'CHAT' },
   clarify:   { bg: '#8b5cf6', label: '❓ CLARIFY' },
   confirm_purchase: { bg: '#0891b2', label: '🛒 CONFIRM ORDER' },
+  confirm_loan:     { bg: '#2563eb', label: '💳 CONFIRM LOAN' },
   blocked:   { bg: '#ef4444', label: 'BLOCKED' },
   error:     { bg: '#ef4444', label: 'ERROR' },
   synthesis: { bg: '#f59e0b', label: '✦ SYNTHESIS', gold: true },
@@ -107,17 +113,22 @@ export default function MessageBubble({ message, onFollowUpSelect }) {
 
   const hasSources = sources && sources.length > 0
 
-  // Detect CHART_DATA block — rendered for tool, finance, synthesis, and the
-  // confirm_purchase HITL pause (its prompt is finance's own already-computed
-  // invoice text, embedded CHART_DATA block and all — see orchestration/
-  // confirm.py). Real bug this fixes: without confirm_purchase here, the
-  // raw "<CHART_DATA>{...}</CHART_DATA>" JSON showed up as literal text in
-  // the pause message instead of rendering as a card, AND the AnswerCard's
-  // TL;DR (only shown when there's no chart to defer to) picked up a
-  // meaningless fragment from the instructional "Reply **approve**..." line.
-  const isToolMsg  = agentUsed === 'tool' || agentUsed === 'finance' || agentUsed === 'synthesis'
-    || agentUsed === 'confirm_purchase'
-    || (agentsUsed || []).includes('tool') || (agentsUsed || []).includes('finance')
+  // Detect CHART_DATA block — rendered for tool, finance, credit, risk,
+  // forecast, synthesis, and the confirm_purchase/confirm_loan HITL pauses
+  // (their prompt is finance's/credit's own already-computed invoice/
+  // proposal text, embedded CHART_DATA block and all — see orchestration/
+  // confirm.py, confirm_loan.py). Real bug this fixes: without
+  // confirm_purchase here, the raw "<CHART_DATA>{...}</CHART_DATA>" JSON
+  // showed up as literal text in the pause message instead of rendering as
+  // a card, AND the AnswerCard's TL;DR (only shown when there's no chart to
+  // defer to) picked up a meaningless fragment from the instructional
+  // "Reply **approve**..." line. credit/risk/forecast (Phase 2/3 agents)
+  // had the exact same gap until this fix -- their proposal/analysis cards
+  // were showing as raw unparsed JSON for the same reason.
+  const _CHART_AGENTS = ['tool', 'finance', 'credit', 'risk', 'forecast']
+  const isToolMsg  = _CHART_AGENTS.includes(agentUsed) || agentUsed === 'synthesis'
+    || agentUsed === 'confirm_purchase' || agentUsed === 'confirm_loan'
+    || (agentsUsed || []).some(a => _CHART_AGENTS.includes(a))
   const chartData  = isToolMsg ? parseChartData(text || '') : null
   // The chart card already renders every number in <CHART_DATA> as a table/
   // metrics row — the markdown table that follows it in the same string

@@ -85,26 +85,6 @@ class TestProfitMargin:
         assert "Laptop" in out and "Tablet" in out
 
 
-class TestForecast:
-    def test_default_months(self):
-        out = fa._fast_dispatch("forecast revenue")
-        assert "Revenue Forecast" in out
-
-    def test_explicit_months(self):
-        out = fa._fast_dispatch("forecast revenue for the next 5 months")
-        assert "Next 5 Month" in out
-
-
-class TestChurnRisk:
-    def test_single_customer(self):
-        out = fa._fast_dispatch("is CUST001 at risk of churning")
-        assert "Churn Risk" in out
-
-    def test_compare_multiple_customers(self):
-        out = fa._fast_dispatch("compare churn risk between CUST001 and CUST003")
-        assert "Risk Comparison" in out
-
-
 class TestDemand:
     def test_predicts_demand(self):
         out = fa._fast_dispatch("predict demand for PRD001")
@@ -142,7 +122,7 @@ class TestGstImpact:
 
     def test_all_products(self):
         out = fa._fast_dispatch("how does GST impact the pricing of all products")
-        assert "GST Impact Across 20 Product" in out
+        assert "GST Impact Across 140 Product" in out
 
     def test_category_gst_impact(self):
         out = fa._fast_dispatch("how does GST affect Clothing pricing in general")
@@ -241,11 +221,11 @@ class TestRecencyAndContextualQuestion:
         assert "Laptop" in out and "Tablet" in out
         assert "Product Comparison" in out
 
-    def test_single_customer_churn_question_does_not_merge_with_history(self):
-        """Guards the flip side of the merge fix: a plain single-customer
-        churn question must NOT pull in an unrelated customer from history
-        just because min_count logic exists -- only an explicit comparison
-        cue ('compare', 'between', 'vs', 'both') should trigger merging."""
+    def test_churn_question_no_longer_handled_by_finance(self):
+        """Churn/retention questions moved to the Risk agent (Phase 2) --
+        finance's own _fast_dispatch must no longer recognize them at all.
+        See tests/test_risk_fast_dispatch.py for the equivalent coverage
+        (including the history-merge guard) on the new owner."""
         contextual = (
             "[Conversation history]\n"
             "User: what discount does CUST001 get\n"
@@ -253,12 +233,7 @@ class TestRecencyAndContextualQuestion:
             "[Current question]\n"
             "is CUST003 at risk of churning"
         )
-        out = fa._fast_dispatch(contextual)
-        assert out is not None
-        assert "Churn Risk" in out
-        assert "Vikram Singh" in out  # CUST003
-        assert "Risk Comparison" not in out
-        assert "Arjun Mehta" not in out  # CUST001 must not leak in
+        assert fa._fast_dispatch(contextual) is None
 
     def test_bare_margin_followup_does_not_merge_stale_products_into_a_comparison(self):
         """Real bug, reproduced live: 'Want to see its profit margin too?'

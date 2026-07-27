@@ -12,13 +12,17 @@ import chromadb
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
+# TEMPORARY: swapped to Gemini embeddings for an experiment -- HuggingFace is
+# commented out below (not deleted) so this reverts with a 2-line change.
+# from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_chroma import Chroma
 
 load_dotenv()
 
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "chroma_store")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+GOOGLE_EMBED_MODEL = os.getenv("GOOGLE_EMBED_MODEL", "models/gemini-embedding-001")
 COLLECTION_NAME = "rag_docs"
 
 # Chunk size chosen so each chunk fits comfortably in the LLM context window
@@ -28,12 +32,22 @@ CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
 
 
-def _get_embeddings() -> HuggingFaceEmbeddings:
-    """Return a cached HuggingFace embedding model."""
-    return HuggingFaceEmbeddings(model_name=EMBED_MODEL)
+def _get_embeddings():
+    """
+    Return the active embedding model.
+
+    TEMPORARY: using Gemini (3072-dim) instead of HuggingFace's
+    all-MiniLM-L6-v2 (384-dim) as an experiment -- these two are NOT
+    interchangeable on an existing ChromaDB collection (different vector
+    dimensionality), so switching back and forth requires re-ingesting any
+    PDFs, not just flipping this function back. Revert by uncommenting the
+    HuggingFaceEmbeddings import above and swapping the return line below.
+    """
+    return GoogleGenerativeAIEmbeddings(model=GOOGLE_EMBED_MODEL)
+    # return HuggingFaceEmbeddings(model_name=EMBED_MODEL)
 
 
-def _get_vectorstore(embeddings: HuggingFaceEmbeddings) -> Chroma:
+def _get_vectorstore(embeddings) -> Chroma:
     """Open (or create) the persisted ChromaDB collection."""
     return Chroma(
         collection_name=COLLECTION_NAME,

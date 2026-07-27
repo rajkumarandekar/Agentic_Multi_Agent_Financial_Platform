@@ -56,6 +56,12 @@ export default function App() {
   const [currentChatId, setCurrentChatId] = useState(null)
   const [chats, setChats]                 = useState([])
   const [loading, setLoading]             = useState(false)
+  // Live "which agent is running right now" label, driven by the
+  // /agent/stream endpoint's "status" SSE events (see api/main.py's
+  // agent_stream_endpoint) -- shown in ChatWindow's loading bubble instead
+  // of a blind spinner. Reset to null whenever loading starts/ends so a
+  // stale label from the previous turn never lingers into the next one.
+  const [loadingStatus, setLoadingStatus] = useState(null)
   const [uploadMsg, setUploadMsg]         = useState(null)
   const [documents, setDocuments]         = useState([])
   const [selectedDoc, setSelectedDoc]     = useState(null)
@@ -169,6 +175,7 @@ export default function App() {
     const userMsg = { role: 'user', text: question }
     setMessages(prev => [...prev, userMsg])
     setLoading(true)
+    setLoadingStatus(null)
 
     // Ensure we have an active chat.
     // chatIsPersisted tracks whether this chatId has a real SQLite row.
@@ -268,9 +275,11 @@ export default function App() {
           // time 'meta' arrives -- swap the "..." loading bubble for the
           // real one now, which then fills in via the reveal queue.
           setLoading(false)
+          setLoadingStatus(null)
           startRevealer()
         },
         (chunkText) => { queue.push(chunkText) },
+        (status) => { setLoadingStatus(status) },
       )
       networkDone = true
       await revealDone   // let the queue finish revealing before persisting
@@ -291,6 +300,7 @@ export default function App() {
       }])
     } finally {
       setLoading(false)
+      setLoadingStatus(null)
     }
   }
 
@@ -351,6 +361,7 @@ export default function App() {
           <ChatWindow
             messages={messages}
             loading={loading}
+            loadingStatus={loadingStatus}
             onCardClick={handleCardClick}
             onFollowUpSelect={handleFollowUpSelect}
           />

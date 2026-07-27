@@ -48,7 +48,7 @@ _SQL_FORMAT_SYSTEM = SystemMessage(content=(
     "CRITICAL RULES:\n"
     "1. If data rows are present → they exist. NEVER say 'not found' when rows are shown.\n"
     "2. Use exact values from the data — never invent or substitute any values.\n"
-    "3. If SQL returns COUNT=20 → say '20 products' — do NOT list them unless names are in the data.\n"
+    "3. If SQL returns a COUNT=N → say 'N products' (or whatever the count is) — do NOT list them unless names are in the data.\n"
     "4. If SQL returns customer rows → show those exact customers with their exact names.\n"
     "5. Never add summary lines that contradict the data shown.\n"
     "6. Format as a clean table using the actual column values returned.\n"
@@ -67,6 +67,27 @@ _SQL_FORMAT_SYSTEM = SystemMessage(content=(
 _SQL_EMPTY_SENTINELS = (
     "no results found for the specified filter criteria.",
     "no matching records found",
+)
+
+# Exact strings finance/credit/risk_agent.py's run() returns from their own
+# except blocks when the underlying ReAct/tool call genuinely failed (Groq
+# rate limit, timeout, malformed tool call, etc.) -- checked the same way as
+# _SQL_EMPTY_SENTINELS above, and for the same reason: a real bug this
+# guards against is sql fetching a perfectly good, complete answer (e.g. a
+# plain "how many transactions last month" count), the supervisor's LLM
+# router THEN unnecessarily chaining into finance/credit/risk anyway
+# (misapplying the sql->finance "calculation on top of fetched data"
+# pattern to a question that needed no further calculation at all), that
+# second call failing, and the failure message silently overwriting sql's
+# good answer because finance/credit/risk normally win pass-through
+# priority unconditionally. If one of these agents failed AND something
+# else in the scratchpad has real content, prefer that instead of the
+# failure sentinel.
+_AGENT_FAILURE_SENTINELS = (
+    "unable to complete the financial analysis. please rephrase the question.",
+    "unable to complete the credit analysis. please rephrase the question.",
+    "unable to complete the risk analysis. please rephrase the question.",
+    "request timed out. please try again.",
 )
 
 def _format_single_column_sql_result(sql_result: str) -> str | None:
@@ -148,14 +169,18 @@ _SYSTEM_CHAT = SystemMessage(content=(
     "- SQL Agent — raw data lookups: customers, products, transactions, order "
     "history. Example: 'show me all customers in Chennai'\n"
     "- Finance Agent — pricing, GST, bulk quotes, loyalty discounts, profit "
-    "margins, revenue forecasts, churn-risk prediction, demand forecasting. "
-    "Example: 'what's the profit margin on PRD001?' or 'is CUST009 at risk "
-    "of churning?'\n"
+    "margins, demand forecasting. Example: 'what's the profit margin on PRD001?'\n"
+    "- Credit Agent — credit eligibility, EMI calculation, loan proposals. "
+    "Example: 'can CUST001 apply for a 50000 rupee loan?'\n"
+    "- Risk Agent — churn/retention risk prediction, fraud/anomaly checks. "
+    "Example: 'is CUST009 at risk of churning?'\n"
+    "- Forecast Agent — revenue forecasts at any horizon (days, weeks, "
+    "months, years). Example: 'forecast revenue for the next 6 months'\n"
     "- RAG Agent — answers questions about an uploaded PDF document. "
     "Example: 'summarise the uploaded report'\n"
     "- Research Agent — external market/industry benchmarks not in "
     "TechMart's own data\n\n"
-    "If asked 'what can you do', 'help', or similar — briefly list these 4 "
+    "If asked 'what can you do', 'help', or similar — briefly list these 7 "
     "specialists with one example each. Do NOT describe generic AI assistant "
     "capabilities.\n"
     "For plain greetings ('hi', 'how are you') — just reply warmly in 1-2 "
@@ -205,13 +230,16 @@ _CANNED_BYE_REPLIES = [
 # Fallback replies ONLY for when the dynamic LLM call below fails -- same
 # graceful-degradation contract as every other Groq call in this file.
 _HI_FALLBACK_REPLIES = [
-    "Hi! I'm TechMart India's assistant. Ask me about product pricing, bulk quotes, customer discounts, churn risk, or revenue forecasts — or upload a PDF to ask about it.",
-    "Hello! Ready to help with TechMart pricing, customer data, or analytics questions whenever you are.",
+    "Hi! I'm TechMart India's assistant. Ask me about product pricing, bulk quotes, customer discounts, loans/EMI, churn risk, or revenue forecasts — or upload a PDF to ask about it.",
+    "Hello! Ready to help with TechMart pricing, credit/loans, risk, forecasting, or customer data questions whenever you are.",
 ]
 _WHOAMI_FALLBACK_REPLY = (
-    "I'm TechMart India's assistant, backed by 4 specialists:\n"
+    "I'm TechMart India's assistant, backed by 7 specialists:\n"
     "- **SQL** — raw data lookups (customers, products, transactions)\n"
-    "- **Finance** — pricing, GST, discounts, margins, forecasts, churn risk\n"
+    "- **Finance** — pricing, GST, discounts, margins\n"
+    "- **Credit** — credit eligibility, EMI, loan proposals\n"
+    "- **Risk** — churn/retention prediction, fraud checks\n"
+    "- **Forecast** — revenue forecasts at any horizon\n"
     "- **RAG** — answers questions about an uploaded PDF\n"
     "- **Research** — external market/industry benchmarks\n\n"
     "Just ask a question and I'll route it to the right one."
@@ -222,22 +250,24 @@ _HI_SYSTEM = SystemMessage(content=(
     "\"hello\", etc). Reply warmly in 1-2 sentences, conversational tone -- "
     "vary your phrasing every time, never repeat a stock sentence. Briefly "
     "mention you can help with product pricing, bulk quotes, customer "
-    "discounts, churn risk, revenue forecasts, or questions about an "
-    "uploaded PDF. Do not format this as a bullet list -- keep it natural "
-    "chat, not a capability menu."
+    "discounts, loans/EMI, churn risk, revenue forecasts, or questions "
+    "about an uploaded PDF. Do not format this as a bullet list -- keep it "
+    "natural chat, not a capability menu."
 ))
 
 _WHOAMI_SYSTEM = SystemMessage(content=(
     "You are TechMart India's assistant. The user asked who you are or what "
     "you can do. Explain -- in your own words, varying the phrasing every "
     "time, never the exact same sentence twice -- that you are backed by "
-    "exactly these 4 specialists and nothing else:\n"
+    "exactly these 7 specialists and nothing else:\n"
     "- SQL Agent — raw data lookups: customers, products, transactions, order history\n"
-    "- Finance Agent — pricing, GST, bulk quotes, loyalty discounts, profit "
-    "margins, revenue forecasts, churn-risk prediction\n"
+    "- Finance Agent — pricing, GST, bulk quotes, loyalty discounts, profit margins\n"
+    "- Credit Agent — credit eligibility, EMI calculation, loan proposals\n"
+    "- Risk Agent — churn/retention risk prediction, fraud/anomaly checks\n"
+    "- Forecast Agent — revenue forecasts at any horizon (days/weeks/months/years)\n"
     "- RAG Agent — answers questions about an uploaded PDF document\n"
     "- Research Agent — external market/industry benchmarks\n"
-    "Never claim capabilities beyond these four (no essay writing, no "
+    "Never claim capabilities beyond these seven (no essay writing, no "
     "translation, no image generation, no general knowledge unrelated to "
     "TechMart's own data). 3-4 short sentences or a short list, whichever "
     "reads more naturally."
@@ -249,7 +279,9 @@ def _dynamic_reply(system: SystemMessage, question: str, fallback: str) -> str:
     unchanged if the call itself fails (network/quota/etc)."""
     try:
         trace_llm_call("RESPONSE dynamic greeting", query=question, system=system.content)
-        llm      = ChatGroq(model=_MODEL, temperature=0.8)
+        # max_tokens caps the RESERVED completion budget Groq counts toward
+        # its TPM rate limit -- see agents/sql_agent.py's identical comment.
+        llm      = ChatGroq(model=_MODEL, temperature=0.8, max_tokens=256)
         response = llm.invoke([system, HumanMessage(content=question)])
         return response.content
     except Exception:
@@ -325,15 +357,21 @@ async def run(question: str, scratchpad: list[dict], messages: list | None = Non
     sql_result      = by_agent.get("sql", "")
     rag_result      = by_agent.get("rag", "")
     finance_result  = by_agent.get("finance", "")
+    credit_result   = by_agent.get("credit", "")
+    risk_result     = by_agent.get("risk", "")
+    forecast_result = by_agent.get("forecast", "")
     research_result = by_agent.get("research", "")
 
     has_sql      = bool(sql_result)
     has_rag      = bool(rag_result)
     has_fin      = bool(finance_result)
+    has_credit   = bool(credit_result)
+    has_risk     = bool(risk_result)
+    has_forecast = bool(forecast_result)
     has_research = bool(research_result)
 
     # ── Chat / greeting — empty scratchpad ────────────────────────────────────
-    if not (has_sql or has_rag or has_fin or has_research):
+    if not (has_sql or has_rag or has_fin or has_credit or has_risk or has_forecast or has_research):
         greeting = _greeting_reply(question)
         if greeting is not None:
             return greeting
@@ -348,33 +386,81 @@ async def run(question: str, scratchpad: list[dict], messages: list | None = Non
                 "RESPONSE chat/greeting",
                 query=question, history=history, system=_SYSTEM_CHAT.content,
             )
-            llm      = ChatGroq(model=_MODEL, temperature=0.8)
+            # max_tokens caps the RESERVED completion budget Groq counts
+            # toward its TPM rate limit -- see sql_agent.py's identical comment.
+            llm      = ChatGroq(model=_MODEL, temperature=0.8, max_tokens=512)
             response = llm.invoke([_SYSTEM_CHAT, HumanMessage(content=chat_prompt)])
             return response.content
         except Exception:
             return "Hi! I'm having trouble reaching the language model right now — please try again in a moment."
 
-    # ── Finance present → ALWAYS pass through directly, regardless of SQL ────
-    # Finance's own tools already query the DB for whatever they need (product/
-    # customer rows, GST rates, etc.) — a companion SQL call in the same turn is
-    # usually the supervisor exploring a dead end (e.g. a GST/analysis question
-    # that also triggered a SQL fetch that returned nothing useful for it).
-    # Combining the two through _SYSTEM_COMBINE used to hand the LLM finance's
-    # correct, fully-computed answer alongside SQL noise and ask it to merge
-    # them — it would then invent placeholder numbers to paper over whatever
-    # the SQL side didn't actually answer. Finance never needs help from SQL to
-    # explain itself, so never route it through the combiner.
-    if has_fin:
-        return finance_result
+    # ── Finance/Credit/Risk/Forecast present → pass through directly, UNLESS
+    # research also ran ──────────────────────────────────────────────────────
+    # Each of these agents' own tools already query the DB for whatever they
+    # need (product/customer rows, GST rates, credit limits, churn model,
+    # ARIMA model, etc.) — a companion SQL call in the same turn is usually
+    # the supervisor exploring a dead end, and combining through
+    # _SYSTEM_COMBINE used to hand the LLM a correct, fully-computed answer
+    # alongside SQL noise and ask it to merge them, inventing placeholder
+    # numbers to paper over whatever SQL didn't actually answer. None of
+    # these four ever need SQL's help to explain themselves.
+    #
+    # research is different: it's the ONLY source of external/industry data
+    # in this system, and none of these four have any access to it either.
+    # A compound question ("compare our margins to industry benchmarks")
+    # that routed to research first and one of these four second needs BOTH
+    # halves — falling through to the generic combiner below (which builds
+    # its prompt from all present sources) instead of discarding research.
+    #
+    # Also skip the pass-through when the agent's own result IS one of its
+    # known failure sentinels (Groq rate-limited, timed out, etc.) AND
+    # something else in the scratchpad has real content -- real bug this
+    # guards against: sql fetches a complete, correct answer (e.g. "how many
+    # transactions last month"), the supervisor's router THEN unnecessarily
+    # chains into finance anyway (over-applying the sql->finance "needs a
+    # calculation on top" pattern to a question that needed none), that
+    # second call fails, and finance's failure message silently overwrote
+    # sql's good answer because finance normally wins pass-through
+    # unconditionally. If nothing else has real content, still return the
+    # failure message as before -- it's honest and there's nothing better.
+    other_present = has_sql or has_rag or has_research
+    fin_failed      = has_fin      and finance_result.strip().lower()  in _AGENT_FAILURE_SENTINELS
+    credit_failed   = has_credit   and credit_result.strip().lower()   in _AGENT_FAILURE_SENTINELS
+    risk_failed     = has_risk     and risk_result.strip().lower()     in _AGENT_FAILURE_SENTINELS
+    forecast_failed = has_forecast and forecast_result.strip().lower() in _AGENT_FAILURE_SENTINELS
 
-    # ── SQL present (alone or with RAG) → SQL formatting template ────────────
+    if has_fin and not has_research and not (fin_failed and other_present):
+        return finance_result
+    if has_credit and not has_research and not (credit_failed and other_present):
+        return credit_result
+    if has_risk and not has_research and not (risk_failed and other_present):
+        return risk_result
+    if has_forecast and not has_research and not (forecast_failed and other_present):
+        return forecast_result
+
+    # ── SQL present (alone or with RAG, but NOT research) → SQL formatting
+    # template. Real bug this guards against: a compound question (e.g.
+    # "market trends AND compare with our TechMart data") can route to
+    # research first, then sql for the internal half -- sql's own answer
+    # (whether empty or just an unhelpful/irrelevant result for a vague
+    # query like "market trends") must NOT discard research's perfectly
+    # good answer to the OTHER half. Whenever research is ALSO present,
+    # skip this whole SQL-only path and fall through to the generic
+    # combiner below, which explicitly builds its prompt from sql_result
+    # AND research_result together -- this is the only path in this
+    # function that actually reconciles the two, and it's why the
+    # combiner's own comment already lists "research + SQL" as a case it
+    # handles, even though (before this fix) control flow could never
+    # actually reach it while has_sql was true.
+    #
     # The template handles the "no RAG" case via its own rule:
     #   "If no documents were retrieved, do NOT add a section about it."
-    if has_sql:
+    if has_sql and not has_research:
         # Genuinely empty result — decided here in Python, not by the LLM.
-        # An earlier version asked the LLM to judge "is this empty?" from the
-        # prompt, which made it invoke the canned no-results message even when
-        # real rows were present (see _SQL_EMPTY_SENTINELS comment above).
+        # An earlier version asked the LLM to judge "is this empty?" from
+        # the prompt, which made it invoke the canned no-results message
+        # even when real rows were present (see _SQL_EMPTY_SENTINELS
+        # comment above).
         if sql_result.strip().lower() in _SQL_EMPTY_SENTINELS:
             return ("No matching records found for your query. "
                     "Please check the product name or filter criteria.")
@@ -402,7 +488,12 @@ async def run(question: str, scratchpad: list[dict], messages: list | None = Non
                 query=question, system=_SQL_FORMAT_SYSTEM.content,
                 extra=f"row_count={row_count}",
             )
-            llm      = ChatGroq(model=_MODEL, temperature=0.3)
+            # max_tokens caps the RESERVED completion budget Groq counts
+            # toward its TPM rate limit -- see sql_agent.py's identical
+            # comment. Higher than the other response_agent calls since
+            # formatting up to 50 rows (the SQL agent's own LIMIT) genuinely
+            # needs more output room.
+            llm      = ChatGroq(model=_MODEL, temperature=0.3, max_tokens=2048)
             response = llm.invoke([_SQL_FORMAT_SYSTEM, HumanMessage(content=prompt)])
             return response.content
         except Exception:
@@ -413,19 +504,38 @@ async def run(question: str, scratchpad: list[dict], messages: list | None = Non
     # ── RAG-only pass-through ─────────────────────────────────────────────────
     # rag_agent already ran an LLM call; re-processing risks paraphrasing away
     # accurate citations or hallucinating from a second reformatting pass.
-    # (has_fin is already False here — that case returned above.)
+    # (has_fin is already False here — that case returned above; has_sql is
+    # also already False here whenever has_research is False, since the SQL
+    # branch above always returns in that case.)
     if has_rag and not has_research:
         return rag_result
 
     # ── Research-only pass-through ────────────────────────────────────────────
-    if has_research and not has_rag:
+    # Must also require none of the other sources are present -- otherwise a
+    # compound question that routed to research plus sql/finance/credit/risk/
+    # forecast would return research alone and silently drop whatever that
+    # other agent actually found. Any such combo goes to the generic
+    # combiner below instead.
+    if (
+        has_research and not has_rag and not has_sql
+        and not has_fin and not has_credit and not has_risk and not has_forecast
+    ):
         return research_result
 
     # ── Generic LLM combine for remaining multi-source cases ──────────────────
-    # (research + RAG, research + SQL, etc. — finance never reaches here.)
+    # (research + sql/finance/credit/risk/forecast/rag, in any combination
+    # that reaches this point.)
     parts = [f"Question: {question}"]
     if has_sql:
         parts.append(f"Transaction data:\n{sql_result}")
+    if has_fin:
+        parts.append(f"Finance analysis:\n{finance_result}")
+    if has_credit:
+        parts.append(f"Credit analysis:\n{credit_result}")
+    if has_risk:
+        parts.append(f"Risk analysis:\n{risk_result}")
+    if has_forecast:
+        parts.append(f"Forecast:\n{forecast_result}")
     if has_rag:
         parts.append(f"Document content:\n{rag_result}")
     if has_research:
@@ -437,7 +547,9 @@ async def run(question: str, scratchpad: list[dict], messages: list | None = Non
             query=question, system=_SYSTEM_COMBINE.content,
             extra=f"sources: sql={has_sql} rag={has_rag} research={has_research}",
         )
-        llm      = ChatGroq(model=_MODEL, temperature=0.3)
+        # max_tokens caps the RESERVED completion budget Groq counts toward
+        # its TPM rate limit -- see sql_agent.py's identical comment.
+        llm      = ChatGroq(model=_MODEL, temperature=0.3, max_tokens=1536)
         response = llm.invoke([_SYSTEM_COMBINE, HumanMessage(content="\n\n".join(parts))])
         return response.content
     except Exception:

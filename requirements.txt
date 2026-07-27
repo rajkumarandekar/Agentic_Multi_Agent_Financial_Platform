@@ -1,6 +1,6 @@
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
-python-dotenv==1.0.1
+python-dotenv==1.2.2
 python-multipart==0.0.12
 
 # LangChain ecosystem
@@ -13,22 +13,44 @@ langchain-chroma==0.1.4
 # Phase 2 additions
 langgraph==0.2.53
 langgraph-checkpoint-sqlite==2.0.11
-aiosqlite==0.20.0
+aiosqlite==0.21.0
 langchain-experimental==0.3.3
-mcp==1.9.0
+mcp==1.28.1
 langchain-mcp-adapters==0.1.0
 
 # Embeddings
 sentence-transformers==3.3.1
 
+# TEMPORARY: Gemini embeddings experiment (revertable -- see
+# ingestion/pdf_ingest.py and orchestration/semantic_router.py, HuggingFace
+# path commented out, not deleted). This bumps langchain-core to 1.5.1,
+# which every langchain==0.3.x / langgraph==0.2.x package below is pinned
+# against <0.4.0 -- pip's resolver flags this as a hard conflict, but it has
+# been verified working at runtime (full test suite green, live embed/store/
+# retrieve tested). Revisit if this experiment is kept long-term.
+langchain-google-genai==4.3.1
+
 # Vector store
-chromadb==0.5.20
+# Bumped by crewai's dependency chain (was 0.5.20) -- langchain-chroma==0.1.4
+# pins chromadb<0.6.0 and pip's resolver flags this as a conflict, but it has
+# been verified working at runtime (add_texts/similarity_search both tested
+# against 1.1.1). Revisit if langchain-chroma is upgraded.
+chromadb==1.1.1
 
 # PDF loading
 pypdf==5.1.0
 
-# Pydantic (FastAPI uses this for request/response models)
-pydantic==2.10.2
+# Pydantic (FastAPI uses this for request/response models; also bumped by crewai)
+pydantic==2.12.5
+
+# Phase 3: Research agent orchestration (see agents/research_agent.py)
+crewai==1.15.6
+# openai SDK -- used directly (not via litellm) to call Groq's OpenAI-
+# compatible endpoint from research_agent.py's custom BaseLLM. litellm
+# (crewai's default LLM backend) needs a Rust/Cargo toolchain to build in
+# this environment and was skipped -- see research_agent.py's module
+# docstring for the full rationale.
+openai==2.48.0
 
 # Testing (dev)
 pytest==9.1.1

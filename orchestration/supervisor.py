@@ -40,9 +40,24 @@ from orchestration.state import AgentState
 
 load_dotenv()
 
-_MODEL          = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+# The supervisor's routing/verification decisions get a STRONGER model than
+# the rest of the app's cheap/fast calls -- this is the ONE place a bad
+# judgment call cascades into every downstream agent, and it's a single
+# short call per turn, so the cost of a bigger model here is negligible.
+# Confirmed live against this project's real Groq key (see project chat
+# history): llama-3.1-8b-instant genuinely re-picks an agent that already
+# ran and can't reliably judge "is this answer already sufficient" from
+# prompt wording alone -- llama-3.3-70b-versatile is Groq's actual
+# available 70B-class model (verified via client.models.list(), not
+# guessed) and is closer to how a real ChatGPT-style orchestrator is
+# built: the strongest model available does the orchestrating, even when
+# it delegates to cheaper specialist tools.
+_ROUTER_MODEL   = os.getenv("ROUTER_MODEL", "llama-3.3-70b-versatile")
 _MAX_ITERATIONS = 3
-_VALID_ROUTES   = {"sql", "rag", "finance", "research", "clarify", "done"}
+_VALID_ROUTES   = {
+    "sql", "rag", "finance", "research", "credit", "risk", "forecast",
+    "clarify", "done",
+}
 
 # Obviously-not-a-business-question pre-filter -- see module docstring.
 # Deliberately narrow: anchored to (near-)whole-message greetings/meta-chat,
@@ -63,6 +78,21 @@ _GREETING_RE = re.compile(
     r'^\s*(who\s+are\s+(you|u)|what\s+are\s+(you|u)|'
     r'what\s+(can|do|will)\s+(you|u)\s+(do|support|help)|'
     r'how\s+can\s+(you|u)\s+help|help\s*[?!.]*)\s*[?!.]*\s*$',
+    re.IGNORECASE,
+)
+
+# research has no TechMart data of its own -- a question asking to compare
+# an external/industry figure against "our"/"TechMart's" own numbers needs a
+# SECOND agent call after research to fetch the internal half. The router
+# LLM (a small, fast model) doesn't reliably follow this as a prompted rule
+# even when made very explicit (confirmed live: it re-picked "research" on
+# turn 2 regardless of wording) -- this is a deterministic backstop, same
+# philosophy as every other hard override in this file (PDF->never sql,
+# same-agent-twice->done): don't trust the small model with a nuanced
+# multi-step judgment call it has empirically already gotten wrong.
+_COMPARE_OWN_DATA_RE = re.compile(
+    r'\b(compare|versus|vs\.?)\b.*\b(our|techmart|my\s+own|us)\b|'
+    r'\b(our|techmart|my\s+own)\b.*\b(compare|versus|vs\.?)\b',
     re.IGNORECASE,
 )
 
@@ -122,13 +152,11 @@ def _build_scratchpad(state: AgentState) -> str:
 _ROUTER_SYSTEM_PROMPT = """You are a routing agent for TechMart India AI.
 
 TechMart India context:
-- 20 products: PRD001 (Laptop), PRD002 (Wireless Earbuds), PRD003 (Smartphone),
-  PRD004 (Tablet), PRD005 (Cotton Shirt), PRD006 (Denim Jeans), PRD007 (Kurta Set),
-  PRD008 (Running Shoes), PRD009 (Air Purifier), PRD010 (Mixer Grinder),
-  PRD011 (Pressure Cooker), PRD012 (Water Purifier), PRD013 (Face Serum),
-  PRD014 (Sunscreen SPF50), PRD015 (Hair Oil Set), PRD016 (Skincare Kit),
-  PRD017 (Yoga Mat), PRD018 (Dumbbells Set), PRD019 (Cricket Bat), PRD020 (Fitness Tracker)
-- 10 customers: CUST001-CUST010 with Bronze/Silver/Gold/Platinum tiers
+- ~140 products (PRD001-PRD140+) across 8 categories: Electronics, Clothing,
+  Home & Kitchen, Beauty, Sports, Groceries, Books & Stationery, Toys & Games
+- ~250 customers (CUST001-CUST250+) with Bronze/Silver/Gold/Platinum tiers
+- Each customer also has a credit_limit, outstanding_balance, and may have
+  loan records (principal, interest_rate, tenure_months, monthly_emi, status)
 
 Decide which specialist agent should handle the CURRENT question. Use the
 conversation history to resolve vague or short messages ("it", "that", "what
@@ -136,10 +164,18 @@ about PRD005", "I asked X not Y") — the current question may only make sense
 in light of what was discussed before.
 
 AGENTS:
-- finance: ANY calculation, pricing, discount, bulk quote, loyalty price,
-           profit margin, GST analysis, revenue forecast (ARIMA model),
-           churn risk prediction (ML model), product comparison by price/margin,
-           most expensive/cheapest product, restock alerts
+- finance: pricing, discount, bulk quote, loyalty price, profit margin,
+           GST analysis, product comparison by price/margin, most
+           expensive/cheapest product, restock/demand alerts, customer
+           lifetime value, category/monthly trend analytics
+- credit: credit eligibility, EMI/installment calculation, loan proposals/
+          applications, available credit, credit limit checks
+- risk: churn/retention risk prediction, fraud/anomaly/suspicious
+        transaction checks (NOT pricing -- a "will this customer leave"
+        question is risk, not finance)
+- forecast: revenue forecast/prediction for any horizon -- next N days,
+            weeks, months, or years (NOT churn -- forecasting is about
+            revenue, not customers)
 - sql: fetching raw data -- show/list/count customers, products, transactions,
        which customers in a city, how many orders, transaction history
 - rag: questions about an uploaded PDF document
@@ -161,7 +197,7 @@ STRICT RULES:
    question about the assistant's own capabilities -- it names a real
    TechMart entity (products/customers/transactions), so it is never `done`.
 4. Never call same agent twice
-5. If finance already ran -> done
+5. If finance, credit, risk, or forecast already ran -> done
 6. A bare list of numbers or product/customer ids (e.g. "12,3,1,4,5,7",
    "prod1, 4, 6" or a follow-up like "what about those?") asking for
    cost/price/average/GST/discount/margin/total is a FINANCE question, even
@@ -201,8 +237,32 @@ STRICT RULES:
     finance, showing/listing data -> sql, etc.). If no such note is present,
     fall back to whatever the assistant's previous message actually offered
     or described.
+13. Churn/retention/fraud questions -> risk, NEVER finance, even if pricing
+    words also appear nearby. Revenue forecast questions (any horizon: next
+    N days/weeks/months/years) -> forecast, NEVER finance. Loan/EMI/credit-
+    eligibility questions -> credit, NEVER finance. These three used to be
+    finance tools; they are now separate agents specifically so a "is this
+    customer at risk" or "forecast next quarter" question is answered by
+    the specialist that actually owns that model, not lumped into finance's
+    pricing/GST/margin scope.
+14. A loan request naming BOTH a customer and an amount is credit, not a
+    plain EMI calculation -- e.g. "apply for a loan of Rs.50000 for CUST001"
+    is credit (produces a full loan proposal with eligibility + risk check),
+    while "what's the EMI on 50000 at 12% for 12 months" with no customer
+    named is also credit (bare EMI math), never finance.
+15. research has ZERO access to TechMart's own database -- it can ONLY
+    return external web search results, nothing about TechMart itself, ever.
+    If "Agents already called" below includes research, you MUST NOT
+    reply "research" again -- that agent has nothing left to add and
+    calling it twice wastes a turn. Instead, check whether the ORIGINAL
+    question also asked to compare against "our"/"TechMart's"/"my own"
+    data (revenue, sales, customers, products) -- if so, reply "sql" (or
+    "finance" for a pricing/margin comparison) to fetch that internal half
+    NOW, since research already answered the external half. Only reply
+    "done" here if the question had no internal-comparison component at
+    all.
 
-Reply with EXACTLY ONE WORD: sql | rag | finance | research | clarify | done"""
+Reply with EXACTLY ONE WORD: sql | rag | finance | credit | risk | forecast | research | clarify | done"""
 
 
 def _route_question(
@@ -259,6 +319,52 @@ def _route_question(
     return route
 
 
+# ── Verifier: "is the question already answered?" ────────────────────────────
+# A dedicated, deliberately narrow yes/no check -- NOT part of _route_question
+# above. Multi-way routing ("which of 7 agents should handle this") is a
+# genuinely hard judgment call for a small/fast model; "does the gathered
+# information already fully answer the question, yes or no" is a much easier
+# one, and it targets the actual failure mode directly instead of reacting to
+# specific bad phrasings after the fact (see supervisor.py's growing set of
+# one-off deterministic overrides below, e.g. the sql-single-value check --
+# this verifier is meant to catch the same class of case more generally).
+_VERIFIER_SYSTEM_PROMPT = """You check whether a question has ALREADY been fully answered by the information gathered so far -- you do NOT decide what to do next, only whether anything more is needed at all.
+
+Reply with EXACTLY ONE WORD: YES or NO.
+
+YES -- the gathered information already contains everything needed to answer the question completely. No further data, calculation, or agent is needed.
+NO -- the question genuinely still needs more data, a calculation on top of what's there, or a different agent's help before it can be answered.
+
+When in doubt, prefer YES if the gathered information directly and completely addresses what was asked -- do not require extra polish or a nicer format, only completeness."""
+
+
+def _is_answer_sufficient(question: str, scratchpad: str, llm) -> bool:
+    """
+    Ask the dedicated yes/no verifier question. Defaults to False (i.e.
+    "not sufficient, keep the normal routing logic in play") on any
+    failure -- if we can't tell, prefer falling through to the existing
+    router/overrides rather than silently cutting the loop short.
+    """
+    try:
+        trace_llm_call(
+            "SUPERVISOR verifier",
+            query=question, system=_VERIFIER_SYSTEM_PROMPT,
+            extra=f"Scratchpad:\n{scratchpad}",
+        )
+        response = llm.invoke([
+            SystemMessage(content=_VERIFIER_SYSTEM_PROMPT),
+            HumanMessage(content=(
+                f"Question: {question}\n\n"
+                f"Gathered so far:\n{scratchpad}\n\n"
+                f"Is the question already fully answered? Reply YES or NO."
+            )),
+        ])
+        return response.content.strip().upper().startswith("Y")
+    except Exception as exc:
+        print(f"[supervisor] verifier call failed ({exc}) -> assume not sufficient")
+        return False
+
+
 # ── Main supervisor node ──────────────────────────────────────────────────────
 
 def supervisor_node(state: AgentState) -> dict:
@@ -296,6 +402,27 @@ def supervisor_node(state: AgentState) -> dict:
         print(f"[supervisor] finance ran -> done")
         return {"route": "done", "iteration_count": n}
 
+    if "credit" in agents_run:
+        # Same HITL gate as finance's invoice check, applied to a loan
+        # proposal instead of a purchase invoice -- see
+        # orchestration/confirm_loan.py. loan_confirmed is set True by
+        # confirm_loan_node once the user approves THIS turn.
+        last_credit = next((e for e in reversed(scratchpad) if e.get("agent") == "credit"), None)
+        result_text = str(last_credit.get("result", "")) if last_credit else ""
+        if "Loan Proposal #" in result_text and not state.get("loan_confirmed"):
+            print(f"[supervisor] credit produced a loan proposal -> confirm_loan")
+            return {"route": "confirm_loan", "iteration_count": n}
+        print(f"[supervisor] credit ran -> done")
+        return {"route": "done", "iteration_count": n}
+
+    if "risk" in agents_run:
+        print(f"[supervisor] risk ran -> done")
+        return {"route": "done", "iteration_count": n}
+
+    if "forecast" in agents_run:
+        print(f"[supervisor] forecast ran -> done")
+        return {"route": "done", "iteration_count": n}
+
     if len(agents_run) != len(set(agents_run)):
         print(f"[supervisor] duplicate agent -> done")
         return {"route": "done", "iteration_count": n}
@@ -303,6 +430,34 @@ def supervisor_node(state: AgentState) -> dict:
     if n == 1 and not agents_run and _GREETING_RE.match(question.strip()):
         print(f"[supervisor] greeting/meta-chat pre-filter -> done (no LLM call)")
         return {"route": "done", "iteration_count": n}
+
+    # ── Verifier: has this question already been fully answered? ─────────────
+    # Only relevant once something has actually run (agents_run non-empty --
+    # on a fresh question there's nothing to verify yet) and only for the
+    # agents that DON'T already have their own hard "always done" stop above
+    # (finance/credit/risk/forecast) -- by construction, reaching this point
+    # with agents_run non-empty means only sql/rag/research have run so far,
+    # which is exactly the category that used to fall through to the router
+    # LLM every subsequent turn with no sufficiency check at all. A cheap,
+    # dedicated yes/no call here (see _is_answer_sufficient's own docstring
+    # for why this is a more reliable judgment than multi-way routing)
+    # short-circuits straight to "done" instead of letting the router guess
+    # at whether a second agent is still needed.
+    if agents_run:
+        scratchpad_text_for_verify = _build_scratchpad(state)
+        # max_tokens caps the RESERVED completion budget Groq counts toward
+        # the TPM limit, not just actual output length -- left unset
+        # (None), Groq reserves the model's full max output allowance
+        # regardless of how short the real answer is. Confirmed live: this
+        # was the actual cause of repeated 413 "rate_limit_exceeded" errors
+        # this session across multiple agents, not genuine traffic volume
+        # -- a one-word YES/NO or routing answer was still being billed
+        # against a multi-thousand-token reservation. 10 is generous for a
+        # single word.
+        verifier_llm = ChatGroq(model=_ROUTER_MODEL, temperature=0, max_tokens=10)
+        if _is_answer_sufficient(question, scratchpad_text_for_verify, verifier_llm):
+            print(f"[supervisor] verifier: question already fully answered -> done")
+            return {"route": "done", "iteration_count": n}
 
     # ── Fast path: regex + semantic embedding pre-filter (no LLM call) ────────
     # Only on a genuinely fresh question -- first iteration, nothing run yet,
@@ -326,7 +481,7 @@ def supervisor_node(state: AgentState) -> dict:
 
     # ── LLM Call: Route the question (skipped if the fast path was confident) ─
     if route is None:
-        llm   = ChatGroq(model=_MODEL, temperature=0)
+        llm   = ChatGroq(model=_ROUTER_MODEL, temperature=0, max_tokens=10)  # one-word route, see verifier_llm's comment above
         route = _route_question(
             question=question,
             history=history,
@@ -341,6 +496,47 @@ def supervisor_node(state: AgentState) -> dict:
     if route == "sql" and has_pdf:
         print(f"[supervisor] override: SQL blocked (PDF active) -> rag")
         route = "rag"
+
+    # ── Override: research re-picked after already running on a question
+    # that also asked to compare against TechMart's OWN data -> redirect to
+    # sql instead of letting the "already ran" override below collapse this
+    # straight to "done" with only the external half of the question answered.
+    if (
+        route == "research" and "research" in agents_run
+        and "sql" not in agents_run and "finance" not in agents_run
+        and _COMPARE_OWN_DATA_RE.search(question)
+    ):
+        # finance, not sql: a generic NL->SQL query has no idea what
+        # "market trends" maps to as a TechMart column/metric and comes
+        # back empty or useless (verified live). finance's
+        # monthly_trend_analysis tool is a purpose-built "how are we doing
+        # overall" summary -- an actual comparable figure, not a guess.
+        print(f"[supervisor] override: research re-picked for an our-data comparison -> finance")
+        route = "finance"
+
+    # ── Override: sql already gave a complete, self-contained answer, but the
+    # router wants to chain into finance/credit/risk/forecast anyway -> trust
+    # sql's answer instead. Real bug this guards against: a plain "how many
+    # transactions last month" question gets fully answered by sql (a bare
+    # count, e.g. "total_transactions\n4"), but the router over-applies rule
+    # 8's "sql then finance if a calculation is still needed on top" to a
+    # question that needed no further calculation at all -- the LLM
+    # (llama-3.1-8b-instant) doesn't reliably judge this distinction from
+    # prompt wording alone (confirmed live, same class of miss as the
+    # research-repick case above). Narrowly scoped to a SINGLE-VALUE sql
+    # result (one header line + one value line, no commas) -- genuinely
+    # multi-row/multi-column results (e.g. a customer's per-category
+    # spending breakdown) are rule 8's real, legitimate use case and must
+    # still be allowed to chain into finance for a calculation on top.
+    if (
+        route in ("finance", "credit", "risk", "forecast")
+        and "sql" in agents_run and route not in agents_run
+    ):
+        last_sql  = next((e for e in reversed(scratchpad) if e.get("agent") == "sql"), None)
+        sql_lines = [l for l in str(last_sql.get("result", "")).split("\n") if l.strip()] if last_sql else []
+        if len(sql_lines) <= 2 and "," not in (sql_lines[0] if sql_lines else ""):
+            print(f"[supervisor] override: sql already gave a complete single-value answer -> done")
+            route = "done"
 
     # ── Override: agent already ran -> done ─────────────────────────────────
     if route in agents_run:

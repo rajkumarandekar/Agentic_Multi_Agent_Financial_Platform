@@ -64,6 +64,11 @@ class AgentState(TypedDict):
     # turns (unlike pending_followup/source_document).
     order_confirmed: bool
 
+    # Same mechanism as order_confirmed, but for a Credit agent loan
+    # proposal (see orchestration/confirm_loan.py) -- reset to False every
+    # fresh turn, only needs to survive within a single turn's loop.
+    loan_confirmed: bool
+
     # ── Guardrails ────────────────────────────────────────────────────────────
     guardrail_results: dict        # {"input": {...}, "output": {...}}
 

@@ -38,11 +38,31 @@ class TestRegexRoute:
         "calculate GST for this order",
         "give me a bulk quote for 50 units",
         "what discount does a gold tier customer get",
-        "forecast revenue for next quarter",
-        "is CUST009 at risk of churning",
     ])
     def test_finance_phrasings(self, question):
         assert router.regex_route(question) == "finance"
+
+    @pytest.mark.parametrize("question", [
+        "is CUST009 at risk of churning",
+        "flag any suspicious transactions for CUST001",
+    ])
+    def test_risk_phrasings(self, question):
+        assert router.regex_route(question) == "risk"
+
+    @pytest.mark.parametrize("question", [
+        "forecast revenue for next quarter",
+        "predict revenue for the next 10 days",
+    ])
+    def test_forecast_phrasings(self, question):
+        assert router.regex_route(question) == "forecast"
+
+    @pytest.mark.parametrize("question", [
+        "apply for a loan of 50000 rupees",
+        "what's the EMI on this loan",
+        "check credit eligibility for CUST001",
+    ])
+    def test_credit_phrasings(self, question):
+        assert router.regex_route(question) == "credit"
 
     @pytest.mark.parametrize("question", [
         "any industry benchmark data on this",
@@ -193,7 +213,12 @@ class TestSupervisorFastPathWiring:
         state = _state(
             question="what about those",
             iteration_count=1,
-            scratchpad=[{"agent": "sql", "result": "..."}],
+            # Multi-row/multi-column result, not a placeholder -- a bare
+            # "..." would accidentally satisfy supervisor.py's "sql already
+            # gave a complete single-value answer -> done" override (see
+            # that override's own comment) and mask what this test is
+            # actually checking (fast path disabled mid-loop).
+            scratchpad=[{"agent": "sql", "result": "product_id,category\nPRD001,Electronics\nPRD002,Clothing"}],
         )
         result = sup.supervisor_node(state)
         assert calls == []

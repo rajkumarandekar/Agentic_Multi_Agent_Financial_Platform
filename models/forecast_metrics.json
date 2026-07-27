@@ -1,12 +1,12 @@
 {
-  "mae": 228868.61,
-  "mape": 50.8,
-  "rmse": 232820.73,
+  "mae": 758006.4,
+  "mape": 45.31,
+  "rmse": 775626.04,
   "best_order": [
-    0,
-    0,
-    0
+    1,
+    1,
+    1
   ],
-  "train_months": 18,
-  "last_month": "2026-05"
+  "train_months": 43,
+  "last_month": "2026-07"
 }

@@ -33,8 +33,15 @@ import os
 import re
 
 import numpy as np
+from dotenv import load_dotenv
 
-_VALID_FAST_ROUTES = {"sql", "finance", "research"}
+# Previously unnecessary (HuggingFace's local model needs no API key), but
+# the temporary Gemini embedding swap below reads GOOGLE_API_KEY from the
+# environment -- this module can no longer silently rely on some other
+# already-imported module having called load_dotenv() first.
+load_dotenv()
+
+_VALID_FAST_ROUTES = {"sql", "finance", "credit", "risk", "forecast", "research"}
 
 # ── Layer 1: regex ────────────────────────────────────────────────────────────
 # Deliberately narrow and anchored to unambiguous keyword combinations only --
@@ -49,7 +56,28 @@ _SQL_RE = re.compile(
 
 _FINANCE_RE = re.compile(
     r'\b(price|pricing|discount|margin|gst|quote|profit|invoice|bulk\s*order|'
-    r'loyalty|forecast|churn\w*|revenue|cheapest|most\s+expensive)\b',
+    r'loyalty|cheapest|most\s+expensive)\b',
+    re.IGNORECASE,
+)
+
+# churn/forecast/loan used to be finance keywords -- now dedicated agents
+# (Phase 2 of the multi-agent expansion), checked BEFORE _FINANCE_RE so a
+# question like "is this customer at risk" never falls through to finance
+# just because a generic word also matches nearby.
+_CREDIT_RE = re.compile(
+    r'\b(loan|emi|installment|credit\s+eligib\w*|credit\s+limit|available\s+credit|'
+    r'collections?\s+priorit\w*|overdue\s+account\w*|'
+    r'(who|which\s+customers?)\s+should\s+we\s+chase)\b',
+    re.IGNORECASE,
+)
+
+_RISK_RE = re.compile(
+    r'\b(churn\w*|at\s+risk|retention|fraud|suspicious|anomaly|anomalous)\b',
+    re.IGNORECASE,
+)
+
+_FORECAST_RE = re.compile(
+    r'\b(forecast|predict(ed)?\s+revenue|future\s+revenue|revenue\s+(next|for))\b',
     re.IGNORECASE,
 )
 
@@ -61,7 +89,8 @@ _RESEARCH_RE = re.compile(
 
 
 def regex_route(question: str) -> str | None:
-    """Return 'sql' | 'finance' | 'research' | None (no confident match)."""
+    """Return 'sql' | 'finance' | 'credit' | 'risk' | 'forecast' | 'research'
+    | None (no confident match)."""
     q = question.strip()
     # research checked first: its keywords (competitor, industry benchmark,
     # market trend) are specific enough that they should win even when a
@@ -69,6 +98,13 @@ def regex_route(question: str) -> str | None:
     # (e.g. "how do competitors price similar products").
     if _RESEARCH_RE.search(q):
         return "research"
+    # credit/risk/forecast checked before finance -- see comment above.
+    if _CREDIT_RE.search(q):
+        return "credit"
+    if _RISK_RE.search(q):
+        return "risk"
+    if _FORECAST_RE.search(q):
+        return "forecast"
     if _FINANCE_RE.search(q):
         return "finance"
     if _SQL_RE.search(q):
@@ -79,6 +115,7 @@ def regex_route(question: str) -> str | None:
 # ── Layer 2: semantic (embedding similarity) ─────────────────────────────────
 
 _EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2")
+_GOOGLE_EMBED_MODEL_NAME = os.getenv("GOOGLE_EMBED_MODEL", "models/gemini-embedding-001")
 _SIMILARITY_THRESHOLD = 0.55
 
 _ROUTE_EXAMPLES: dict[str, list[str]] = {
@@ -95,9 +132,26 @@ _ROUTE_EXAMPLES: dict[str, list[str]] = {
         "calculate the GST for this order",
         "give me a bulk quote for 50 units",
         "what discount does a gold tier customer get",
-        "forecast revenue for the next 3 months",
-        "is this customer at risk of churning",
         "what's the loyalty price for this item",
+    ],
+    "credit": [
+        "can this customer apply for a loan",
+        "what's the EMI on a 50000 rupee loan",
+        "check credit eligibility for this customer",
+        "how much available credit does this customer have",
+        "which customers should we chase for overdue payments",
+    ],
+    "risk": [
+        "is this customer at risk of churning",
+        "will this customer stop buying from us",
+        "flag any suspicious transactions for this customer",
+        "check for fraud on this account",
+    ],
+    "forecast": [
+        "forecast revenue for the next 3 months",
+        "predict next week's revenue",
+        "what will our sales look like next year",
+        "revenue forecast for the next 10 days",
     ],
     "research": [
         "what are the industry benchmarks for this",
@@ -114,10 +168,18 @@ _route_vectors: dict[str, np.ndarray] | None = None
 
 
 def _get_embeddings():
+    """
+    TEMPORARY: using Gemini embeddings instead of HuggingFace as an
+    experiment -- see ingestion/pdf_ingest.py's _get_embeddings() for the
+    full rationale/revert note. Same swap here: HuggingFace import/line
+    commented out, not deleted.
+    """
     global _embeddings
     if _embeddings is None:
-        from langchain_huggingface import HuggingFaceEmbeddings
-        _embeddings = HuggingFaceEmbeddings(model_name=_EMBED_MODEL_NAME)
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+        _embeddings = GoogleGenerativeAIEmbeddings(model=_GOOGLE_EMBED_MODEL_NAME)
+        # from langchain_huggingface import HuggingFaceEmbeddings
+        # _embeddings = HuggingFaceEmbeddings(model_name=_EMBED_MODEL_NAME)
     return _embeddings
 
 

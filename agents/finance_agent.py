@@ -1,7 +1,7 @@
 """
 finance_agent.py — TechMart India Finance Agent
 
-11 tools across 3 categories. Python/ML do ALL arithmetic — the LLM only
+10 tools across 3 categories. Python/ML do ALL arithmetic — the LLM only
 picks which tool to call and extracts parameter values.
 
 Category A — Company Math (deterministic Python):
@@ -12,17 +12,24 @@ Category A — Company Math (deterministic Python):
   5. generate_invoice           — formatted invoice with all line items
 
 Category B — ML Predictions:
-  6. forecast_revenue           — ARIMA n-month revenue forecast
-  7. predict_customer_risk      — RandomForest churn risk + probability
-  8. predict_demand             — LinearRegression demand vs stock check
+  6. predict_demand             — LinearRegression demand vs stock check
 
 Category C — Analytics (SQL + Python):
-  9. customer_lifetime_value    — CLV from transaction history
- 10. category_performance       — revenue/growth/returns per category
- 11. monthly_trend_analysis     — 18-month trend, best/worst, MoM growth
+  7. customer_lifetime_value    — CLV from transaction history
+  8. category_performance       — revenue/growth/returns per category
+  9. monthly_trend_analysis     — full revenue trend, best/worst, MoM growth
 
 _direct_calc is retained for generic math (GST%, CAGR, ROI) that do not
 require a DB lookup — these bypass create_react_agent entirely.
+
+Revenue forecasting (ARIMA) and churn-risk prediction (RandomForest) used to
+live here but are now owned by dedicated agents (agents/forecast_agent.py,
+agents/risk_agent.py) — see Phase 2 of the multi-agent expansion. The
+underlying tool functions (forecast_revenue, predict_customer_risk,
+compare_customer_risk) still physically live in this module and are
+imported/reused by those agents rather than duplicated, but this module's
+own _fast_dispatch no longer routes to them — that routing now belongs to
+the Forecast/Risk agents' own dispatchers.
 """
 
 import asyncio
@@ -124,6 +131,45 @@ def _num(s: str) -> float:
     return float(re.sub(r"[₹₨,\s]", "", s))
 
 
+# Confirmed live (see project chat history): when NO real tool genuinely
+# fits a question, the ReAct model sometimes reaches for the
+# closest-sounding tool anyway, with a made-up argument that doesn't match
+# its actual schema (e.g. calling prioritize_collections with a
+# "customer_id" it doesn't even accept), and emits this as a raw pseudo
+# tool-call STRING in the message content rather than a real tool_calls
+# entry -- confirmed via tool_calls=[] on that exact AIMessage. Since no
+# ToolMessage exists for a call that was never actually registered/
+# executed, it would otherwise flow straight through as the "final
+# answer" and leak this garbage directly to the user.
+_LEAKED_TOOL_CALL_RE = re.compile(r'^\s*<(\w+)>\s*\{.*?\}\s*</\1>\s*$', re.DOTALL)
+
+
+def _looks_like_leaked_tool_call(text: str) -> bool:
+    """True if `text` is a hallucinated pseudo tool-call that was never
+    actually executed, not a genuine final answer."""
+    return bool(_LEAKED_TOOL_CALL_RE.match((text or "").strip()))
+
+
+# Standard cost-of-capital assumption for an Indian retail business -- not
+# fit to this data, just a reasonable annual discount rate for NPV math.
+_CLV_DISCOUNT_RATE = 0.10
+
+
+def _npv(monthly_cashflow: float, months: int, annual_rate: float) -> float:
+    """
+    Present value of a constant monthly cash flow received for `months`
+    months, discounted at `annual_rate` (annual, converted to a compounding
+    monthly rate). Used by customer_lifetime_value to turn "aov * frequency
+    * N months" from a spreadsheet sum into a genuine NPV figure -- money
+    expected 3 years from now is worth less today than money expected next
+    month.
+    """
+    monthly_rate = (1 + annual_rate) ** (1 / 12) - 1
+    if monthly_rate == 0:
+        return monthly_cashflow * months
+    return sum(monthly_cashflow / (1 + monthly_rate) ** t for t in range(1, months + 1))
+
+
 def _normalize_id(raw_id: str, prefix: str) -> str:
     """
     Zero-pad a product/customer id to the DB's PRD001/CUST001 format.
@@ -198,7 +244,7 @@ def calculate_selling_price(product_id: str) -> str:
     Use when asked: selling price, price of PRD, cost of product, how much is PRD."""
     prod = _get_product(product_id)
     if not prod:
-        return f"Product {product_id} not found in the catalogue. Available products: PRD001-PRD020."
+        return f"Product {product_id} was not found in the catalogue."
 
     base       = prod["base_cost"]
     margin     = prod["margin_pct"]
@@ -542,7 +588,7 @@ def predict_customer_risk(customer_id: str) -> str:
     customer_id = _normalize_id(customer_id, "CUST")
     cust_rows = _query_db("SELECT * FROM customers WHERE customer_id = ?", (customer_id,))
     if not cust_rows:
-        return f"Customer {customer_id} not found. Available customers are CUST001-CUST010."
+        return f"Customer {customer_id} was not found."
     c = cust_rows[0]
 
     # Compute the same features used during training
@@ -557,7 +603,11 @@ def predict_customer_risk(customer_id: str) -> str:
     uniq_prods  = len({t["product_id"] for t in txns})
     avg_qty     = sum(t["quantity"] for t in txns) / max(len(txns), 1)
 
-    feature_values = [total_spend, order_count, aov, days_inact, return_rate,
+    # days_inactive/return_rate are deliberately excluded here -- they're
+    # what the training-time label rule thresholds on (see train_models.py),
+    # so the model only ever sees behavioral/purchase-pattern features.
+    # Both are still shown in the output below, just not fed to the model.
+    feature_values = [total_spend, order_count, aov,
                       uniq_cats, uniq_prods, avg_qty]
     X = np.array([feature_values])
 
@@ -657,7 +707,7 @@ def customer_lifetime_value(customer_id: str) -> str:
     customer_id = _normalize_id(customer_id, "CUST")
     cust_rows = _query_db("SELECT * FROM customers WHERE customer_id = ?", (customer_id,))
     if not cust_rows:
-        return f"Customer {customer_id} not found. Available customers are CUST001-CUST010."
+        return f"Customer {customer_id} was not found."
     c = cust_rows[0]
 
     txns = _query_db(
@@ -677,9 +727,21 @@ def customer_lifetime_value(customer_id: str) -> str:
     months_active = max(((last_txn - first_txn).days / 30), 1)
     freq_per_mo  = round(order_count / months_active, 2)
 
-    # CLV projections: 1 year and 3 year
-    clv_1y = round(aov * freq_per_mo * 12, 2)
+    # CLV projection: 3 year (undiscounted, i.e. rupees valued at face
+    # value regardless of when they land) -- kept alongside the NPV figure
+    # below so the discounting effect itself is visible.
     clv_3y = round(aov * freq_per_mo * 36, 2)
+
+    # NPV versions: a rupee earned in month 36 is worth less TODAY than one
+    # earned next month, so the undiscounted totals above overstate a
+    # customer's true present value -- this is what makes the 3-year figure
+    # a genuine financial metric rather than a spreadsheet sum. Monthly cash
+    # flow is assumed constant at aov * freq_per_mo (the customer's current
+    # run-rate); _CLV_DISCOUNT_RATE is a standard cost-of-capital assumption
+    # for an Indian retail business, not fit to this data.
+    monthly_cashflow = aov * freq_per_mo
+    npv_1y = round(_npv(monthly_cashflow, 12, _CLV_DISCOUNT_RATE), 2)
+    npv_3y = round(_npv(monthly_cashflow, 36, _CLV_DISCOUNT_RATE), 2)
 
     # Tier comparison: average CLV for same tier
     tier_avg_rows = _query_db(
@@ -704,13 +766,14 @@ def customer_lifetime_value(customer_id: str) -> str:
     card = {
         "type":         "calculation",
         "title":        f"Lifetime Value — {c['customer_name']}",
-        "result_value": f"₹{clv_1y:,.0f}",
-        "result_label": "1-Year CLV",
+        "result_value": f"₹{npv_1y:,.0f}",
+        "result_label": "1-Year CLV (NPV)",
         "metrics": [
-            {"label": "Total Lifetime Spend", "value": f"₹{total_spend:,.2f}"},
-            {"label": "Orders",                "value": str(order_count)},
-            {"label": "Avg Order Value",       "value": f"₹{aov:,.2f}"},
-            {"label": "3-Year CLV",             "value": f"₹{clv_3y:,.0f}"},
+            {"label": "Total Lifetime Spend",  "value": f"₹{total_spend:,.2f}"},
+            {"label": "Orders",                 "value": str(order_count)},
+            {"label": "Avg Order Value",        "value": f"₹{aov:,.2f}"},
+            {"label": "3-Year CLV (NPV)",        "value": f"₹{npv_3y:,.0f}"},
+            {"label": "3-Year CLV (undiscounted)", "value": f"₹{clv_3y:,.0f}"},
         ],
     }
     return (
@@ -720,8 +783,9 @@ def customer_lifetime_value(customer_id: str) -> str:
         f"- Orders: {order_count}\n"
         f"- Avg Order Value: ₹{aov:,.2f}\n"
         f"- Purchase Frequency: {freq_per_mo:.2f}/month\n"
-        f"- **1-Year CLV: ₹{clv_1y:,.0f}**\n"
-        f"- **3-Year CLV: ₹{clv_3y:,.0f}**\n"
+        f"- **1-Year CLV (NPV @ {_CLV_DISCOUNT_RATE*100:.0f}%): ₹{npv_1y:,.0f}**\n"
+        f"- **3-Year CLV (NPV @ {_CLV_DISCOUNT_RATE*100:.0f}%): ₹{npv_3y:,.0f}** "
+        f"(₹{clv_3y:,.0f} undiscounted)\n"
         f"- vs {c['tier']} tier avg: {vs_tier:+.1f}%\n\n"
         f"**Monthly Spend (last 6 months):**\n| Month | Revenue |\n|---|---|\n"
         + recent_rows
@@ -782,9 +846,10 @@ def category_performance(category: str) -> str:
         ],
     }
     top_lines = "\n".join(f"| {p['product_name']} | ₹{p['rev']:,.0f} |" for p in top_prods)
+    n_months = len(rows)
     bullet_data = {
         "metrics": [
-            {"label": "Total Revenue (18 months)", "value": f"₹{total_rev:,.0f}"},
+            {"label": f"Total Revenue ({n_months} months)", "value": f"₹{total_rev:,.0f}"},
             {"label": "Total Orders",                "value": str(total_ord)},
             {"label": "Avg Order Value",             "value": f"₹{aov:,.2f}"},
             {"label": "Return Rate",                 "value": f"{return_rate}%"},
@@ -796,7 +861,7 @@ def category_performance(category: str) -> str:
         _chart(card)
         + f"**{category} — Category Performance**\n\n"
         f"| Metric | Value |\n|---|---|\n"
-        f"| Total Revenue (18 months) | ₹{total_rev:,.0f} |\n"
+        f"| Total Revenue ({n_months} months) | ₹{total_rev:,.0f} |\n"
         f"| Total Orders | {total_ord} |\n"
         f"| Avg Order Value | ₹{aov:,.2f} |\n"
         f"| Return Rate | {return_rate}% |\n"
@@ -809,7 +874,7 @@ def category_performance(category: str) -> str:
 
 @tool
 def monthly_trend_analysis() -> str:
-    """Analyse the full 18-month revenue trend: MoM growth, best/worst months, trajectory.
+    """Analyse the full revenue trend across all months of data: MoM growth, best/worst months, trajectory.
     Use when asked: 'monthly trend', 'how are we doing', 'sales trend', 'overall performance',
     'business performance', 'revenue over time'."""
     rows = _query_db(
@@ -855,9 +920,10 @@ def monthly_trend_analysis() -> str:
         f"| {rows[i+1]['month']} | ₹{rows[i+1]['total_revenue']:,.0f} | {mom_rates[i]:+.1f}% |"
         for i in range(len(mom_rates))
     )
+    n_months = len(rows)
     bullet_data = {
         "metrics": [
-            {"label": "Total Revenue (18 months)", "value": f"₹{total_rev:,.0f}"},
+            {"label": f"Total Revenue ({n_months} months)", "value": f"₹{total_rev:,.0f}"},
             {"label": "Monthly Average",            "value": f"₹{avg_rev:,.0f}"},
             {"label": "Best Month",                 "value": f"{rows[best_idx]['month']} (₹{revenues[best_idx]:,.0f})"},
             {"label": "Worst Month",                "value": f"{rows[worst_idx]['month']} (₹{revenues[worst_idx]:,.0f})"},
@@ -867,9 +933,9 @@ def monthly_trend_analysis() -> str:
     }
     return (
         _chart(card)
-        + f"**TechMart India — 18-Month Revenue Trend**\n\n"
+        + f"**TechMart India — {n_months}-Month Revenue Trend**\n\n"
         f"| Summary Metric | Value |\n|---|---|\n"
-        f"| Total Revenue (18 months) | ₹{total_rev:,.0f} |\n"
+        f"| Total Revenue ({n_months} months) | ₹{total_rev:,.0f} |\n"
         f"| Monthly Average | ₹{avg_rev:,.0f} |\n"
         f"| Best Month | {rows[best_idx]['month']} (₹{revenues[best_idx]:,.0f}) |\n"
         f"| Worst Month | {rows[worst_idx]['month']} (₹{revenues[worst_idx]:,.0f}) |\n"
@@ -1447,7 +1513,8 @@ CUST009=Amit Joshi (Bronze), CUST010=Meera Iyer (Silver)
 
 _SYSTEM_PROMPT = f"""\
 You are TechMart India's Finance Agent. Use the tools to answer questions about
-pricing, discounts, forecasting, churn risk, and business analytics.
+pricing, discounts, and business analytics. Revenue forecasting is handled by
+the Forecast agent and churn/fraud risk by the Risk agent -- not you.
 
 PRODUCT IDs:
 {_PRODUCTS_MAP}
@@ -1461,8 +1528,6 @@ TOOL SELECTION:
 - calculate_loyalty_price  → discount for CUST, loyalty price
 - calculate_profit_margin  → profit on product, margin, how much we make
 - generate_invoice         → invoice / bill for customer + product
-- forecast_revenue         → predict/forecast revenue, next N months
-- predict_customer_risk    → churn risk, retention, will customer leave
 - predict_demand           → restock, demand for product, inventory
 - customer_lifetime_value  → CLV, lifetime value, total spend
 - category_performance     → how is Electronics/Clothing doing
@@ -1483,8 +1548,8 @@ RULES:
    "what did I ask before", anything about the chat itself rather than
    TechMart's data — do NOT force a mismatched tool call. Reply in plain text
    that this isn't something you can look up, or ask what specific data they
-   want. Forcing an irrelevant tool (e.g. a revenue forecast for "summarise
-   what we discussed") is worse than declining.
+   want. Forcing an irrelevant tool (e.g. a customer lifetime value lookup for
+   "summarise what we discussed") is worse than declining.
 7. If product_id is not specified, state you need a product ID in your response.
 """
 
@@ -1494,14 +1559,11 @@ _ALL_TOOLS = [
     calculate_loyalty_price,
     calculate_profit_margin,
     generate_invoice,
-    forecast_revenue,
-    predict_customer_risk,
     predict_demand,
     customer_lifetime_value,
     category_performance,
     monthly_trend_analysis,
     compare_products,
-    compare_customer_risk,
     explain_gst_impact,
     explain_multi_product_gst_impact,
     compare_gst_by_category,
@@ -1516,7 +1578,8 @@ _ALL_TOOLS = [
 _PRD_RE  = re.compile(r'\b(PRD\d{3})\b', re.IGNORECASE)
 _CUST_RE = re.compile(r'\b(CUST\d{3})\b', re.IGNORECASE)
 _CAT_RE  = re.compile(
-    r'\b(Electronics|Clothing|Sports|Beauty|Home\s*&?\s*Kitchen)\b', re.IGNORECASE
+    r'\b(Electronics|Clothing|Sports|Beauty|Home\s*&?\s*Kitchen|Groceries|'
+    r'Books\s*&?\s*Stationery|Toys\s*&?\s*Games)\b', re.IGNORECASE
 )
 
 # Natural-language product name → PRD id — covers all 20 products plus common
@@ -1782,6 +1845,12 @@ _CATEGORY_WORDS = {
     "kitchen":        "Home & Kitchen",
     "beauty":         "Beauty",
     "sports":         "Sports",
+    "groceries":      "Groceries",
+    "grocery":        "Groceries",
+    "books":          "Books & Stationery",
+    "stationery":     "Books & Stationery",
+    "toys":           "Toys & Games",
+    "games":          "Toys & Games",
 }
 
 # Discount/tier-only question — "what discount does CUST003 get?", "what tier is
@@ -2091,7 +2160,8 @@ def _fast_dispatch(question: str) -> str | None:
     # ── GST impact analysis (single product, multi product, or category) ──
     if _GST_IMPACT_RE.search(current):
         if re.search(r'\ball\s+products?\b', q_lower):
-            all_ids = [f"PRD{n:03d}" for n in range(1, 21)]
+            all_rows = _query_db("SELECT product_id FROM products")
+            all_ids  = [r["product_id"] for r in all_rows]
             return explain_multi_product_gst_impact.invoke({"product_ids": all_ids})
         cat = _extract_category(current)
         if cat:
@@ -2134,15 +2204,6 @@ def _fast_dispatch(question: str) -> str | None:
             return generate_invoice.invoke({"customer_id": cid, "product_id": pid, "quantity": qty})
         return None
 
-    # ── Revenue forecast ───────────────────────────────────────────────
-    if re.search(
-        r'\b(forecast|predict(ed)?\s+revenue|future\s+revenue|next\s+\d+\s+months?\s+(revenue|sales))\b',
-        q_lower,
-    ):
-        m = re.search(r'\bnext\s+(\d{1,2})\s+months?\b', q_lower)
-        months = int(m.group(1)) if m else 3
-        return forecast_revenue.invoke({"months_ahead": months})
-
     # ── Monthly trend / overall performance ───────────────────────────
     if re.search(
         r'\b(monthly\s+trend|sales\s+trend|overall\s+performance|business\s+performance|'
@@ -2155,21 +2216,6 @@ def _fast_dispatch(question: str) -> str | None:
     if re.search(r'\bcategory\s+performance\b|\bhow\s+is\s+\w+.*\bdoing\b', q_lower):
         cat = _extract_category(current) or _extract_category(full)
         return category_performance.invoke({"category": cat}) if cat else None
-
-    # ── Churn / retention risk ─────────────────────────────────────────
-    if re.search(r'\b(churn|at\s+risk|retention|will\s+.*\bleave\b|inactive\s+customer)\b', q_lower):
-        # Only require 2 customers (merging from history if needed) when the
-        # question itself signals a comparison -- otherwise a plain single-
-        # customer churn question ("is CUST003 at risk?") must not merge in
-        # an unrelated customer from history and turn into a comparison
-        # nobody asked for.
-        wants_comparison = bool(re.search(r'\b(compare|between|versus|vs\.?|both)\b', q_lower))
-        cids = _resolve_customers_for_dispatch(current, full, min_count=2 if wants_comparison else 1)
-        if len(cids) >= 2:
-            return compare_customer_risk.invoke({"customer_ids": cids})
-        if len(cids) == 1:
-            return predict_customer_risk.invoke({"customer_id": cids[0]})
-        return None
 
     # ── Demand / restock ───────────────────────────────────────────────
     if re.search(r'\b(demand|restock|run\s+out|inventory\s+check|how\s+many\s+will\s+sell)\b', q_lower):
@@ -2304,7 +2350,11 @@ async def run(
         return dispatched
 
     # Full ReAct agent for complex questions
-    llm   = ChatGroq(model=_MODEL, temperature=0)
+    # max_tokens caps the RESERVED completion budget Groq counts toward its
+    # TPM rate limit -- left unset, Groq reserves the model's full max
+    # output allowance regardless of actual answer length, confirmed live
+    # to cause repeated 413 "rate_limit_exceeded" errors this session.
+    llm   = ChatGroq(model=_MODEL, temperature=0, max_tokens=1024)
     agent = create_react_agent(
         llm, _ALL_TOOLS,
         state_modifier=SystemMessage(content=_SYSTEM_PROMPT),
@@ -2323,7 +2373,14 @@ async def run(
         tool_msgs = [m for m in result["messages"] if isinstance(m, ToolMessage)]
         if tool_msgs:
             return tool_msgs[0].content
-        return result["messages"][-1].content
+        final_text = result["messages"][-1].content
+        if _looks_like_leaked_tool_call(final_text):
+            logger.warning("finance_agent: model hallucinated an unexecuted tool call for: %s", question)
+            return (
+                "I don't have a specific tool for that request. Could you rephrase it, "
+                "or ask about a specific product/category/customer?"
+            )
+        return final_text
     except asyncio.TimeoutError:
         logger.error("finance_agent timed out for: %s", question)
         return "Request timed out. Please try again."

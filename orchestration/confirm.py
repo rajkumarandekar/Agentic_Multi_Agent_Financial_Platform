@@ -92,7 +92,14 @@ def confirm_purchase_node(state: AgentState) -> dict:
 
     if _APPROVE_RE.search(answer):
         print("[confirm_purchase] approved")
-        return {"order_confirmed": True}
+        new_scratchpad = [
+            e if e.get("agent") != "finance" else {
+                "agent": "finance",
+                "result": "✅ **Order confirmed and placed.**\n\n" + str(e.get("result", "")),
+            }
+            for e in scratchpad
+        ]
+        return {"scratchpad": new_scratchpad, "order_confirmed": True}
 
     # Neither pattern matched (e.g. "maybe", "what's the return policy?") --
     # treat as not-yet-decided rather than guessing either way. Since

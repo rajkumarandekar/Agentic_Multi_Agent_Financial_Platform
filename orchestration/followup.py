@@ -46,7 +46,11 @@ _TITLE_RULES: list[tuple[str, str | None]] = [
 # Fallback for the 3 tools whose card has no "title" field -- matched
 # against the plain-text markdown heading instead.
 _TEXT_HEADING_RULES: list[tuple[str, str | None]] = [
-    ("18-Month Revenue Trend",  "Want a category performance breakdown too?"),
+    # "-Month Revenue Trend" (not "18-Month...") -- monthly_trend_analysis's
+    # heading now shows the ACTUAL number of months of data (see
+    # agents/finance_agent.py), which grows over time as more data is
+    # generated, so this must match regardless of the specific number.
+    ("-Month Revenue Trend",  "Want a category performance breakdown too?"),
     ("Category Performance",   "Want to see the overall sales trend too?"),
     ("Revenue Forecast",       "Want to see the demand forecast for a specific product?"),
 ]

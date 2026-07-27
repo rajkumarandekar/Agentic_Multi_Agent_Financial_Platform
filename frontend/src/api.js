@@ -53,9 +53,10 @@ export async function sendMessage(question, sessionId, sourceDocument = null, ag
  * @param {string|null} agentOverride
  * @param {(meta: object) => void} onMeta   - fires once, before any chunks (agent_used, sources, followup, session_id, etc. -- everything from AgentResponse except `answer`)
  * @param {(chunkText: string) => void} onChunk - fires once per word, in order
+ * @param {(status: {agent: string, label: string}) => void} [onStatus] - fires once per graph node as it ACTUALLY completes, before the answer is ready -- lets the UI show live progress ("Credit Agent — evaluating...") instead of a blind spinner. Optional: omit if the caller doesn't want live status.
  * @returns {Promise<void>} resolves once the stream completes
  */
-export async function sendMessageStream(question, sessionId, sourceDocument = null, agentOverride = null, onMeta, onChunk) {
+export async function sendMessageStream(question, sessionId, sourceDocument = null, agentOverride = null, onMeta, onChunk, onStatus) {
   const body = { question, session_id: sessionId }
   if (sourceDocument) body.source_document = sourceDocument
   if (agentOverride && agentOverride !== 'auto') body.agent_override = agentOverride
@@ -112,8 +113,10 @@ export async function sendMessageStream(question, sessionId, sourceDocument = nu
       const eventName = eventMatch[1]
       const data = JSON.parse(dataMatch[1])
 
-      if (eventName === 'meta') onMeta?.(data)
+      if (eventName === 'status') onStatus?.(data)
+      else if (eventName === 'meta') onMeta?.(data)
       else if (eventName === 'chunk') onChunk?.(data.text)
+      else if (eventName === 'error') throw new Error(data.detail || 'Request failed')
       // 'done' needs no handling -- reader.read()'s `done` ends the loop
       // naturally right after the server closes the stream.
     }

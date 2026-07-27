@@ -1,19 +1,17 @@
 {
-  "accuracy": 0.6,
+  "accuracy": 0.62,
   "classes": [
     "High Risk",
     "Low Risk",
     "Medium Risk"
   ],
   "feature_importances": {
-    "total_spend": 0.1118,
-    "order_count": 0.0884,
-    "avg_order_value": 0.1547,
-    "days_inactive": 0.2685,
-    "return_rate": 0.0954,
-    "unique_categories": 0.0,
-    "unique_products": 0.0793,
-    "avg_quantity": 0.2019
+    "total_spend": 0.185,
+    "order_count": 0.2076,
+    "avg_order_value": 0.1672,
+    "unique_categories": 0.0869,
+    "unique_products": 0.2105,
+    "avg_quantity": 0.1428
   },
-  "n_customers": 10
+  "n_customers": 250
 }

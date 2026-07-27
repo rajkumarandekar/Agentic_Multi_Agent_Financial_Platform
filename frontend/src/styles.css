@@ -500,6 +500,14 @@ body {
   40%           { transform: scale(1.2); opacity: 1;   }
 }
 
+/* Live "which agent is running" label next to the loading dots -- driven by
+   /agent/stream's "status" SSE events (see App.jsx, ChatWindow.jsx). */
+.loading-status-label {
+  margin-left: 4px;
+  font-size: 0.85rem;
+  color: #6b7280;
+}
+
 /* ── Document list ───────────────────────────────────────────────────────── */
 .filter-active {
   font-size: 0.72rem;
@@ -900,6 +908,9 @@ body {
 .card--green { background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%); }
 .card--blue  { background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%); }
 .card--orange{ background: linear-gradient(135deg, #ffedd5 0%, #fed7aa 100%); }
+.card--teal  { background: linear-gradient(135deg, #ccfbf1 0%, #99f6e4 100%); }
+.card--red   { background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%); }
+.card--purple{ background: linear-gradient(135deg, #ede9fe 0%, #ddd6fe 100%); }
 
 .card-top {
   display: flex;
@@ -917,9 +928,12 @@ body {
   padding: 2px 8px;
   border-radius: 999px;
 }
-.label--sql  { background: #bbf7d0; color: #15803d; }
-.label--rag  { background: #bfdbfe; color: #1d4ed8; }
-.label--tool { background: #fed7aa; color: #c2410c; }
+.label--sql      { background: #bbf7d0; color: #15803d; }
+.label--rag      { background: #fed7aa; color: #c2410c; }
+.label--finance  { background: #99f6e4; color: #0f766e; }
+.label--credit   { background: #bfdbfe; color: #1d4ed8; }
+.label--risk     { background: #fecaca; color: #b91c1c; }
+.label--forecast { background: #ddd6fe; color: #6d28d9; }
 
 .card-q {
   font-size: 0.85rem;
