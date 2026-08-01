@@ -36,14 +36,20 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ---- copy the rest of the application ----------------------------------------
 COPY agents/        ./agents/
 COPY api/           ./api/
+COPY config/        ./config/
+COPY data/          ./data/
 COPY ingestion/     ./ingestion/
+COPY models/        ./models/
 COPY observability/ ./observability/
 COPY orchestration/ ./orchestration/
-COPY data/          ./data/
 
-# Ensure the data directory exists so /upload can write PDFs at runtime.
-# (The COPY above already creates it, but this guards against an empty data/.)
-RUN mkdir -p /app/data
+# data/company.db and data/company_data.xlsx are gitignored (generated, not
+# committed) -- so a fresh clone/build has neither. Regenerate them here so
+# the SQL/finance/credit/risk/forecast agents have real data at runtime.
+# models/*.pkl (churn classifier, sales forecaster) ARE committed, so those
+# are not regenerated -- train_models.py takes minutes and isn't rerun on
+# every build.
+RUN python data/generate_company_data.py && python data/setup_db.py
 
 # ---- runtime -----------------------------------------------------------------
 # HF Spaces injects secrets as environment variables; .env is not present.

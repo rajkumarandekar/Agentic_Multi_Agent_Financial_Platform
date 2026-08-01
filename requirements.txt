@@ -4,11 +4,29 @@ python-dotenv==1.2.2
 python-multipart==0.0.12
 
 # LangChain ecosystem
-langchain==0.3.7
-langchain-community==0.3.7
-langchain-groq==0.2.1
-langchain-huggingface==0.1.2
-langchain-chroma==0.1.4
+# langchain-core pinned explicitly: langchain-chroma>=0.2.6 and
+# langchain-google-genai>=2.0 both declare langchain-core>=0.3.7x with NO
+# upper bound, so without this pin pip's resolver is free to pick the
+# latest 1.5.1 -- which breaks the <0.4.0 upper bound every other package
+# below still needs. 0.3.86 is the newest release still on the pre-1.0
+# line, verified via a real fresh install (not just "worked at runtime").
+langchain-core==0.3.86
+# Bumped from 0.3.7/0.3.7/0.2.1/0.1.2 -- those original pins depend on
+# langsmith<0.2.0, which conflicts with langchain-core==0.3.86's own
+# langsmith<1.0.0,>=0.3.45 requirement. These are the latest releases still
+# on the pre-1.0 langchain-core line (each verified via wheel METADATA to
+# require langchain-core<1.0.0 / <2.0.0, all satisfied by 0.3.86 above).
+langchain==0.3.30
+langchain-community==0.3.31
+langchain-groq==0.3.8
+langchain-huggingface==0.3.1
+# 1.1.0 (the version this was bumped to earlier) requires
+# langchain-core>=1.1.3, which is incompatible with the rest of this
+# langchain==0.3.x ecosystem. 0.2.6 is the newest release still compatible
+# with langchain-core<0.4.0 (requires >=0.3.76, <no upper bound>) and with
+# chromadb==1.3.5 below (requires chromadb>=1.0.20, no upper bound) --
+# verified via wheel METADATA inspection, not guessed.
+langchain-chroma==0.2.6
 
 # Phase 2 additions
 langgraph==0.2.53
@@ -23,18 +41,22 @@ sentence-transformers==3.3.1
 
 # TEMPORARY: Gemini embeddings experiment (revertable -- see
 # ingestion/pdf_ingest.py and orchestration/semantic_router.py, HuggingFace
-# path commented out, not deleted). This bumps langchain-core to 1.5.1,
-# which every langchain==0.3.x / langgraph==0.2.x package below is pinned
-# against <0.4.0 -- pip's resolver flags this as a hard conflict, but it has
-# been verified working at runtime (full test suite green, live embed/store/
-# retrieve tested). Revisit if this experiment is kept long-term.
-langchain-google-genai==4.3.1
+# path commented out, not deleted). Downgraded from the latest 4.3.1 to
+# 2.1.12 -- the newest release still compatible with langchain-core<0.4.0
+# (requires >=0.3.75) -- so the whole ecosystem resolves together in one
+# pip pass instead of relying on incremental installs that skip full
+# resolver validation. Revisit if this experiment is kept long-term.
+langchain-google-genai==2.1.12
 
 # Vector store
-# Bumped by crewai's dependency chain (was 0.5.20) -- langchain-chroma==0.1.4
-# pins chromadb<0.6.0 and pip's resolver flags this as a conflict, but it has
-# been verified working at runtime (add_texts/similarity_search both tested
-# against 1.1.1). Revisit if langchain-chroma is upgraded.
+# A real fresh `pip install -r requirements.txt` (not incremental installs
+# over a session, which sidestep pip's full resolver check) proved
+# langchain-chroma==0.1.4 + chromadb==1.1.1's original pairing (chromadb
+# pinned loose) was fine, but crewai==1.15.6 below hard-pins
+# chromadb~=1.1.0 (>=1.1.0,<1.2.0) -- so this is pinned to the newest
+# patch in that exact range. langchain-chroma==0.2.6 above only needs
+# chromadb>=1.0.20, so 1.1.1 satisfies both -- verified via a real fresh
+# install, not just "worked at runtime last time".
 chromadb==1.1.1
 
 # PDF loading
@@ -51,6 +73,22 @@ crewai==1.15.6
 # this environment and was skipped -- see research_agent.py's module
 # docstring for the full rationale.
 openai==2.48.0
+
+# ML / data pipeline -- used by agents/finance_agent.py (numpy, joblib),
+# models/train_models.py (all of these), and data/generate_company_data.py
+# (pandas, openpyxl). Missing from this file entirely until now -- the app
+# only worked locally because these were already installed in this venv
+# from earlier manual setup; a genuinely fresh `pip install -r
+# requirements.txt` (a clean clone, CI, or a fresh Docker build) would fail
+# immediately on `import numpy` in finance_agent.py. Discovered while
+# checking whether a real CI pipeline could even build this project.
+numpy==1.26.4
+pandas==3.0.3
+scikit-learn==1.9.0
+statsmodels==0.14.6
+pmdarima==2.1.1
+openpyxl==3.1.5
+joblib==1.5.3
 
 # Testing (dev)
 pytest==9.1.1

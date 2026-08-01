@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate test data (data/company.db is gitignored)
+        run: |
+          python data/generate_company_data.py
+          python data/setup_db.py
+
+      - name: Run test suite
+        # No real API keys are configured as secrets -- tests that would
+        # need Groq/Tavily/Google calls monkeypatch those env vars out and
+        # assert on the resulting "not configured" behavior instead.
+        run: python -m pytest -q

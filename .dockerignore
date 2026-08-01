@@ -1,0 +1,28 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.git/
+.github/
+
+# Generated at Docker build time (see Dockerfile) -- excluding the stale
+# host copies keeps the image build from depending on local dev state.
+data/company.db
+data/company_data.xlsx
+data/checkpoints.db
+data/checkpoints.db-wal
+data/checkpoints.db-shm
+data/chats.db
+data/chats.db-wal
+data/chats.db-shm
+data/*.pdf
+
+chroma_store/
+node_modules/
+frontend/node_modules/
+frontend/dist/
+dbg_*.txt
