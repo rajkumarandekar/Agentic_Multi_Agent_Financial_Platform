@@ -689,3 +689,24 @@ def auto_title_endpoint(chat_id: str, body: AutoTitleRequest) -> dict:
     """Set chat title from the first user question."""
     title = _cs_auto_title(chat_id, body.question)
     return {"title": title}
+
+
+# ---------------------------------------------------------------------------
+# Serve the built React frontend (single-service deploy: HF Spaces/Docker).
+# The Dockerfile runs `npm run build` into frontend/dist before this file
+# ever runs, so this is a no-op locally (dist/ doesn't exist there -- run the
+# Vite dev server instead, see frontend/vite.config.js).
+# ---------------------------------------------------------------------------
+from pathlib import Path                                      # noqa: E402
+from fastapi.staticfiles import StaticFiles                   # noqa: E402
+from fastapi.responses import FileResponse                    # noqa: E402
+
+_FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+
+if _FRONTEND_DIST.is_dir():
+    app.mount("/assets", StaticFiles(directory=_FRONTEND_DIST / "assets"), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_frontend(full_path: str) -> FileResponse:
+        """SPA catch-all -- registered last, so every API route above still matches first."""
+        return FileResponse(_FRONTEND_DIST / "index.html")
