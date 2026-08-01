@@ -38,6 +38,7 @@ COPY agents/        ./agents/
 COPY api/           ./api/
 COPY config/        ./config/
 COPY data/          ./data/
+COPY guardrails/    ./guardrails/
 COPY ingestion/     ./ingestion/
 COPY models/        ./models/
 COPY observability/ ./observability/
