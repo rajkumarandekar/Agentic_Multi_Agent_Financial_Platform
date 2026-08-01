@@ -31,7 +31,7 @@ import re
 
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_groq import ChatGroq
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 from observability.trace import trace_agent_start, trace_llm_call
 from orchestration import followup
@@ -44,15 +44,20 @@ load_dotenv()
 # the rest of the app's cheap/fast calls -- this is the ONE place a bad
 # judgment call cascades into every downstream agent, and it's a single
 # short call per turn, so the cost of a bigger model here is negligible.
-# Confirmed live against this project's real Groq key (see project chat
-# history): llama-3.1-8b-instant genuinely re-picks an agent that already
-# ran and can't reliably judge "is this answer already sufficient" from
-# prompt wording alone -- llama-3.3-70b-versatile is Groq's actual
-# available 70B-class model (verified via client.models.list(), not
-# guessed) and is closer to how a real ChatGPT-style orchestrator is
-# built: the strongest model available does the orchestrating, even when
-# it delegates to cheaper specialist tools.
-_ROUTER_MODEL   = os.getenv("ROUTER_MODEL", "llama-3.3-70b-versatile")
+# Routing/verification run on Gemini rather than Groq (every other agent in
+# this codebase still uses ChatGroq) -- this is an isolated experiment: only
+# the one-word routing/verifier calls below are affected, every actual
+# answer (finance/sql/credit/risk/forecast/rag/response) is untouched and
+# still Groq. Needs GOOGLE_API_KEY set (same key ingestion/pdf_ingest.py's
+# Gemini embeddings experiment already uses).
+#
+# Pinned dated models (gemini-2.0-flash, gemini-2.0-flash-lite) returned
+# `429 RESOURCE_EXHAUSTED ... limit: 0` on this project's API key -- a hard
+# zero quota, not a transient rate limit (verified live). "gemini-flash-latest"
+# is the only alias that actually returned content on this key. Revisit if
+# billing/quota is fixed on the Google Cloud project -- an alias can point to
+# a different model without notice, which a pinned dated model wouldn't.
+_ROUTER_MODEL   = os.getenv("ROUTER_MODEL", "gemini-flash-latest")
 _MAX_ITERATIONS = 3
 _VALID_ROUTES   = {
     "sql", "rag", "finance", "research", "credit", "risk", "forecast",
@@ -80,6 +85,26 @@ _GREETING_RE = re.compile(
     r'how\s+can\s+(you|u)\s+help|help\s*[?!.]*)\s*[?!.]*\s*$',
     re.IGNORECASE,
 )
+
+def _extract_text(content) -> str:
+    """
+    Normalize an LLM response's `.content` to plain text.
+
+    ChatGroq always returns a plain string. Gemini's newer "thinking" models
+    (e.g. gemini-flash-latest) instead return a list of content blocks like
+    [{"type": "text", "text": "sql", ...}] -- confirmed live against this
+    project's real Google API key. Plain `.strip()` on that list would raise
+    AttributeError, so pull the text out of whichever shape comes back.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block.get("text", "") for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return str(content)
+
 
 # research has no TechMart data of its own -- a question asking to compare
 # an external/industry figure against "our"/"TechMart's" own numbers needs a
@@ -149,120 +174,53 @@ def _build_scratchpad(state: AgentState) -> str:
 
 # ── LLM Call: Router ──────────────────────────────────────────────────────────
 
-_ROUTER_SYSTEM_PROMPT = """You are a routing agent for TechMart India AI.
+_ROUTER_SYSTEM_PROMPT = """You are the master routing agent for TechMart India AI.
 
-TechMart India context:
-- ~140 products (PRD001-PRD140+) across 8 categories: Electronics, Clothing,
-  Home & Kitchen, Beauty, Sports, Groceries, Books & Stationery, Toys & Games
-- ~250 customers (CUST001-CUST250+) with Bronze/Silver/Gold/Platinum tiers
-- Each customer also has a credit_limit, outstanding_balance, and may have
-  loan records (principal, interest_rate, tenure_months, monthly_emi, status)
+====================================================================
+CRITICAL LANGUAGE HANDLING RULE (FOR POOR ENGLISH & TYPOS):
+- The user may write using heavily broken English, slang, typos, or rapid shortcuts (e.g., "gimme prodts", "wanna look buyers", "net not work yestday", "custmr balance").
+- Do NOT search for exact match keywords from the rules below.
+- Step 1: Translate the broken sentence mentally into its core business meaning.
+- Step 2: Map that underlying meaning to the correct agent.
+- Treat clear typos as their intended words (e.g., "prodts"/"prods" -> products, "custmr"/"cust" -> customer, "refnd" -> finance).
+====================================================================
 
-Decide which specialist agent should handle the CURRENT question. Use the
-conversation history to resolve vague or short messages ("it", "that", "what
-about PRD005", "I asked X not Y") — the current question may only make sense
-in light of what was discussed before.
+TechMart India Context:
+- ~140 products (PRD001-PRD140+) across 8 categories: Electronics, Clothing, Home & Kitchen, Beauty, Sports, Groceries, Books & Stationery, Toys & Games.
+- ~250 customers (CUST001-CUST250+) with Bronze/Silver/Gold/Platinum tiers.
+- Each customer has a credit_limit, outstanding_balance, and potential loan records (principal, interest_rate, tenure_months, monthly_emi, status).
 
-AGENTS:
-- finance: pricing, discount, bulk quote, loyalty price, profit margin,
-           GST analysis, product comparison by price/margin, most
-           expensive/cheapest product, restock/demand alerts, customer
-           lifetime value, category/monthly trend analytics
-- credit: credit eligibility, EMI/installment calculation, loan proposals/
-          applications, available credit, credit limit checks
-- risk: churn/retention risk prediction, fraud/anomaly/suspicious
-        transaction checks (NOT pricing -- a "will this customer leave"
-        question is risk, not finance)
-- forecast: revenue forecast/prediction for any horizon -- next N days,
-            weeks, months, or years (NOT churn -- forecasting is about
-            revenue, not customers)
-- sql: fetching raw data -- show/list/count customers, products, transactions,
-       which customers in a city, how many orders, transaction history
-- rag: questions about an uploaded PDF document
-- research: external market data, industry benchmarks, web information
-- done: question already answered in scratchpad, casual greeting, or a
-        question about the CONVERSATION ITSELF (e.g. "summarise what we
-        discussed", "what did I ask before") -- these have no TechMart data
-        to look up, so finance/sql have nothing to do with them; route to
-        done and let the chat reply use conversation history directly
+Use the conversation history to resolve vague or short messages ("it", "that", "what about PRD005", "I asked X not Y") — the current question may only make sense in light of past context.
 
-STRICT RULES:
-1. PDF active -> always rag first (never sql when PDF is selected)
-2. Pricing/calculation -> always finance (never sql for prices)
-3. Any request to see TechMart's own raw data (customers, products,
-   transactions) -> sql, however it's phrased -- "show", "list", "count",
-   "how many", "give me", "gimme", "what products/customers do you have",
-   "I need/want the list of...". These all mean the same thing: fetch and
-   show the real rows. Casual phrasing ("give me products u have") is NOT a
-   question about the assistant's own capabilities -- it names a real
-   TechMart entity (products/customers/transactions), so it is never `done`.
-4. Never call same agent twice
-5. If finance, credit, risk, or forecast already ran -> done
-6. A bare list of numbers or product/customer ids (e.g. "12,3,1,4,5,7",
-   "prod1, 4, 6" or a follow-up like "what about those?") asking for
-   cost/price/average/GST/discount/margin/total is a FINANCE question, even
-   with no other keywords -- it is never sql or research. Route straight to
-   finance; do not try sql or research first "just in case."
-7. If the conversation history shows finance was just discussing
-   pricing/GST/products, and the current question is short or numbers-only
-   with no new topic, it is almost always a continuation of that SAME
-   finance thread -- prefer finance over sql or research.
-8. A question asking to analyse/breakdown a CUSTOMER's actual spending,
-   purchases, or transaction history (by category, over time, by product)
-   -- e.g. "analyse CUST001's spending by category" -- needs REAL
-   transaction data finance does not have access to. Route to sql FIRST to
-   fetch that data, THEN finance if a calculation is still needed on top of
-   it. Never answer this kind of question from finance alone -- finance
-   only knows product/customer master data (price, tier, base stats), not
-   a customer's actual per-category purchase breakdown.
-9. If iteration >= 3 -> done
-10. Greetings (hi, hello, thanks, bye) -> done
-11. A question about the conversation itself ("summarise everything we
-    discussed", "what did I ask before") -> done, never finance/sql. There
-    is no TechMart data to fetch for it -- forcing finance to answer this
-    makes it pick an unrelated tool (e.g. a revenue forecast) just to have
-    something to call, which is worse than a plain conversational reply.
-12. A short reply with no keywords of its own -- an affirmation ("yes",
-    "ok", "sure", "go ahead", "do it", "please resume", "continue") OR a
-    short direct answer to a question that was just asked (a bare product/
-    customer name or ID, a number, "prod5") -- is NEVER routed to done by
-    itself. FIRST check the conversation history for a line starting with
-    "[Note: your previous answer ended with this pending question...]" -- if
-    present, that IS what the current reply is about, whether it's accepting
-    an offer or answering the question directly. Combine the pending
-    question with the current reply to figure out the real request (e.g.
-    pending question "which product and quantity for the invoice?" + current
-    reply "prod5" = generate an invoice for PRD005), and route to whichever
-    agent that combined request needs (profit margin/GST/discount/invoice ->
-    finance, showing/listing data -> sql, etc.). If no such note is present,
-    fall back to whatever the assistant's previous message actually offered
-    or described.
-13. Churn/retention/fraud questions -> risk, NEVER finance, even if pricing
-    words also appear nearby. Revenue forecast questions (any horizon: next
-    N days/weeks/months/years) -> forecast, NEVER finance. Loan/EMI/credit-
-    eligibility questions -> credit, NEVER finance. These three used to be
-    finance tools; they are now separate agents specifically so a "is this
-    customer at risk" or "forecast next quarter" question is answered by
-    the specialist that actually owns that model, not lumped into finance's
-    pricing/GST/margin scope.
-14. A loan request naming BOTH a customer and an amount is credit, not a
-    plain EMI calculation -- e.g. "apply for a loan of Rs.50000 for CUST001"
-    is credit (produces a full loan proposal with eligibility + risk check),
-    while "what's the EMI on 50000 at 12% for 12 months" with no customer
-    named is also credit (bare EMI math), never finance.
-15. research has ZERO access to TechMart's own database -- it can ONLY
-    return external web search results, nothing about TechMart itself, ever.
-    If "Agents already called" below includes research, you MUST NOT
-    reply "research" again -- that agent has nothing left to add and
-    calling it twice wastes a turn. Instead, check whether the ORIGINAL
-    question also asked to compare against "our"/"TechMart's"/"my own"
-    data (revenue, sales, customers, products) -- if so, reply "sql" (or
-    "finance" for a pricing/margin comparison) to fetch that internal half
-    NOW, since research already answered the external half. Only reply
-    "done" here if the question had no internal-comparison component at
-    all.
+AGENT SCOPE DEFINITIONS:
+- sql: Fetching raw data rows or counts from TechMart's database (e.g., viewing, listing, counting customers, products, transactions, or order histories).
+- finance: Pricing, discounts, bulk quotes, loyalty prices, profit margins, GST analysis, product price/margin comparisons, cheapest/most expensive items, restock/demand alerts, customer lifetime value, category/monthly trend analytics.
+- credit: Credit eligibility, EMI/installment math, loan proposals/applications, available credit checks, credit limit validation.
+- risk: Churn/retention risk prediction, fraud/anomaly/suspicious transaction checks. (NOT pricing).
+- forecast: Revenue/sales predictions for any future horizon (days, weeks, months, years). (NOT customer churn).
+- rag: Answering questions strictly about an uploaded PDF document.
+- research: External market data, industry benchmarks, or general web information. (Has ZERO access to TechMart's internal database).
+- done: Question already fully answered in scratchpad, casual greetings, or questions about the conversation itself (e.g., "summarise what we discussed").
 
-Reply with EXACTLY ONE WORD: sql | rag | finance | credit | risk | forecast | research | clarify | done"""
+STRICT ROUTING RULES:
+1. PDF Active: Always route to `rag` first. Never route to `sql` when a PDF is actively selected.
+2. Pricing/Calculations: Always route to `finance`. Never use `sql` to compute prices or margins.
+3. Raw Internal Data Access: Any underlying intent to look at, list, view, count, or fetch rows from TechMart's internal database of products, customers, or transactions must route to `sql`. This applies regardless of messy phrasing (e.g., "gimme list", "show me who buyed", "i want see buyers details").
+4. Bare Lists of Numbers/IDs: If the user provides just IDs/numbers ("prod1, 4, 6" or "12,3,1") and asks for cost/price/average/GST/discount/margin, route straight to `finance`. Never default to `sql` or `research` first for these.
+5. Thread Continuity: If the history shows `finance` was just discussing pricing/GST, and the current message is short or numbers-only with no new topic, treat it as a continuation and prefer `finance`.
+6. Customer Spending Breakdown: Requests to analyze or break down a customer's actual historical spending/purchases require raw transaction history. Route to `sql` FIRST to fetch rows, then `finance` will handle calculations. Never answer this from `finance` alone.
+7. Iteration Cap: If iteration >= 3, always route to `done`.
+8. Greetings/Politeness: Pure casual greetings or sign-offs (hi, hello, thanks, bye) route to `done`.
+9. Conversational Meta-Questions: Questions asking about the chat itself ("summarise everything", "what did I ask before") have no database data to fetch. Route to `done`.
+10. Short Affirmations / Context Replies: Short replies with no keywords ("yes", "ok", "sure", "do it", "prod5") must NEVER be routed to `done` on their own. Check history for a line starting with "[Note: your previous answer ended with this pending question...]". Combine that pending question with the current short reply to determine the true intent, then route accordingly (e.g., Offer pending + "ok" -> route to `finance` or `credit`).
+11. Specialty Boundaries:
+    - Churn/retention/fraud -> `risk` (never finance).
+    - Future revenue horizons -> `forecast` (never finance).
+    - Loan approvals/EMI math -> `credit` (never finance).
+12. Loan Applications: A request naming a customer AND an amount (e.g., "apply loan 50k for CUST001") is `credit`, not finance.
+13. External vs. Internal Comparison: If `research` was already called but the query also asked to compare web data against "our" or "TechMart's" internal metrics, route to `sql` or `finance` next to get the internal data. If no internal comparison is requested, route to `done`.
+
+Reply with EXACTLY ONE WORD from this list: sql | rag | finance | credit | risk | forecast | research | clarify | done"""
 
 
 def _route_question(
@@ -308,7 +266,7 @@ def _route_question(
             SystemMessage(content=_ROUTER_SYSTEM_PROMPT),
             HumanMessage(content=human_msg),
         ])
-        raw = response.content.strip().lower()
+        raw = _extract_text(response.content).strip().lower()
     except Exception as exc:
         print(f"[supervisor] router call failed ({exc}) -> done")
         return "done"
@@ -359,7 +317,7 @@ def _is_answer_sufficient(question: str, scratchpad: str, llm) -> bool:
                 f"Is the question already fully answered? Reply YES or NO."
             )),
         ])
-        return response.content.strip().upper().startswith("Y")
+        return _extract_text(response.content).strip().upper().startswith("Y")
     except Exception as exc:
         print(f"[supervisor] verifier call failed ({exc}) -> assume not sufficient")
         return False
@@ -445,16 +403,17 @@ def supervisor_node(state: AgentState) -> dict:
     # at whether a second agent is still needed.
     if agents_run:
         scratchpad_text_for_verify = _build_scratchpad(state)
-        # max_tokens caps the RESERVED completion budget Groq counts toward
-        # the TPM limit, not just actual output length -- left unset
-        # (None), Groq reserves the model's full max output allowance
+        # max_output_tokens caps the RESERVED completion budget the provider
+        # counts toward its rate limit, not just actual output length -- left
+        # unset (None), Groq reserves the model's full max output allowance
         # regardless of how short the real answer is. Confirmed live: this
         # was the actual cause of repeated 413 "rate_limit_exceeded" errors
-        # this session across multiple agents, not genuine traffic volume
-        # -- a one-word YES/NO or routing answer was still being billed
-        # against a multi-thousand-token reservation. 10 is generous for a
-        # single word.
-        verifier_llm = ChatGroq(model=_ROUTER_MODEL, temperature=0, max_tokens=10)
+        # this session across multiple agents, not genuine traffic volume.
+        # 200 (not 10) because gemini-flash-latest is a "thinking" model that
+        # spends part of this budget on hidden reasoning tokens before the
+        # visible YES/NO -- confirmed live that 10 silently returned empty
+        # content (finish_reason=MAX_TOKENS with zero visible text).
+        verifier_llm = ChatGoogleGenerativeAI(model=_ROUTER_MODEL, temperature=0, max_output_tokens=200)
         if _is_answer_sufficient(question, scratchpad_text_for_verify, verifier_llm):
             print(f"[supervisor] verifier: question already fully answered -> done")
             return {"route": "done", "iteration_count": n}
@@ -481,7 +440,7 @@ def supervisor_node(state: AgentState) -> dict:
 
     # ── LLM Call: Route the question (skipped if the fast path was confident) ─
     if route is None:
-        llm   = ChatGroq(model=_ROUTER_MODEL, temperature=0, max_tokens=10)  # one-word route, see verifier_llm's comment above
+        llm   = ChatGoogleGenerativeAI(model=_ROUTER_MODEL, temperature=0, max_output_tokens=200)  # one-word route, see verifier_llm's comment above
         route = _route_question(
             question=question,
             history=history,
