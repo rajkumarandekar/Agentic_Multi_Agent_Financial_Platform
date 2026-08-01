@@ -27,7 +27,11 @@ jobs:
           python data/setup_db.py
 
       - name: Run test suite
-        # No real API keys are configured as secrets -- tests that would
+        # No real API keys are configured as secrets -- most tests that would
         # need Groq/Tavily/Google calls monkeypatch those env vars out and
-        # assert on the resulting "not configured" behavior instead.
+        # assert on the resulting "not configured" behavior instead. A handful
+        # of error-path tests only construct a ChatGroq client (never call the
+        # network) but still need *a* key present, so a dummy value is enough.
+        env:
+          GROQ_API_KEY: dummy-ci-key
         run: python -m pytest -q
