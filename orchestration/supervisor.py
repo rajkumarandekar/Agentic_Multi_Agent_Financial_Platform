@@ -393,7 +393,7 @@ def supervisor_node(state: AgentState) -> dict:
         # -- a one-word YES/NO or routing answer was still being billed
         # against a multi-thousand-token reservation. 10 is generous for a
         # single word.
-        verifier_llm = ChatGroq(model=_ROUTER_MODEL, temperature=0, max_tokens=10, max_retries=0)
+        verifier_llm = ChatGroq(model=_ROUTER_MODEL, temperature=0, max_tokens=10, max_retries=1)
         if _is_answer_sufficient(question, scratchpad_text_for_verify, verifier_llm):
             print(f"[supervisor] verifier: question already fully answered -> done")
             return {"route": "done", "iteration_count": n}
@@ -420,7 +420,7 @@ def supervisor_node(state: AgentState) -> dict:
 
     # ── LLM Call: Route the question (skipped if the fast path was confident) ─
     if route is None:
-        llm   = ChatGroq(model=_ROUTER_MODEL, temperature=0, max_tokens=10, max_retries=0)  # one-word route, see verifier_llm's comment above
+        llm   = ChatGroq(model=_ROUTER_MODEL, temperature=0, max_tokens=10, max_retries=1)  # one-word route, see verifier_llm's comment above
         route = _route_question(
             question=question,
             history=history,

@@ -21,6 +21,8 @@ from langchain_groq import ChatGroq
 from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt import create_react_agent
 
+from agents.groq_errors import is_rate_limited, RATE_LIMIT_MESSAGE
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -332,7 +334,7 @@ def run(question: str, messages: list | None = None, entity_question: str | None
     # output allowance regardless of actual answer length, which was
     # confirmed live to trigger repeated 413 "rate_limit_exceeded" errors
     # even for short questions/results (see project chat history).
-    llm = ChatGroq(model=SQL_MODEL, temperature=0, max_tokens=1024, max_retries=0)
+    llm = ChatGroq(model=SQL_MODEL, temperature=0, max_tokens=1024, max_retries=1)
     agent = create_react_agent(
         llm, [execute_sql_tool],
         state_modifier=SystemMessage(content=system_prompt),
@@ -360,8 +362,14 @@ def run(question: str, messages: list | None = None, entity_question: str | None
             "try asking about a specific table instead, e.g. \"show me products\", "
             "\"list customers\", or \"show recent transactions\"."
         )
-    except Exception:
-        # Genuine API/connection failure — friendly fallback (Bug 6)
+    except Exception as exc:
+        # A Groq rate limit is NOT the same thing as "no data" -- confirmed
+        # live that a 429 mid-react-loop was returning "not found"/"0
+        # results" here, which looks exactly like an empty database instead
+        # of a temporary API failure. Only fall back to the generic
+        # "not found" wording for a genuine API/connection failure.
+        if is_rate_limited(exc):
+            return RATE_LIMIT_MESSAGE
         if entity.get("customer_id"):
             return f"No matching records found for customer {entity['customer_id']}."
         if entity.get("product_id"):

@@ -47,6 +47,8 @@ from langchain_core.tools import tool
 from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 
+from agents.groq_errors import is_rate_limited, RATE_LIMIT_MESSAGE
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -2354,7 +2356,7 @@ async def run(
     # TPM rate limit -- left unset, Groq reserves the model's full max
     # output allowance regardless of actual answer length, confirmed live
     # to cause repeated 413 "rate_limit_exceeded" errors this session.
-    llm   = ChatGroq(model=_MODEL, temperature=0, max_tokens=1024, max_retries=0)
+    llm   = ChatGroq(model=_MODEL, temperature=0, max_tokens=1024, max_retries=1)
     agent = create_react_agent(
         llm, _ALL_TOOLS,
         state_modifier=SystemMessage(content=_SYSTEM_PROMPT),
@@ -2386,4 +2388,6 @@ async def run(
         return "Request timed out. Please try again."
     except Exception as exc:
         logger.error("finance_agent error: %s", exc, exc_info=True)
+        if is_rate_limited(exc):
+            return RATE_LIMIT_MESSAGE
         return "Unable to complete the financial analysis. Please rephrase the question."

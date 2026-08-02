@@ -102,7 +102,7 @@ def _check_llm_safety(question: str) -> dict:
     """
     try:
         trace_llm_call("INPUT GUARD safety check", query=question, system=_SAFETY_SYSTEM)
-        llm = ChatGroq(model=GROQ_MODEL, temperature=0, max_retries=0)
+        llm = ChatGroq(model=GROQ_MODEL, temperature=0, max_retries=1)
         response = llm.invoke([
             SystemMessage(content=_SAFETY_SYSTEM),
             HumanMessage(content=question),

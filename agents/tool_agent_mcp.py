@@ -72,7 +72,7 @@ async def run(question: str) -> str:
         args=["-y", "@modelcontextprotocol/server-filesystem", data_dir],
     )
 
-    llm = ChatGroq(model=GROQ_MODEL, temperature=0, max_retries=0)
+    llm = ChatGroq(model=GROQ_MODEL, temperature=0, max_retries=1)
 
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:

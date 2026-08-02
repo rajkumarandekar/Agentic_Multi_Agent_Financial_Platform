@@ -281,7 +281,7 @@ def _dynamic_reply(system: SystemMessage, question: str, fallback: str) -> str:
         trace_llm_call("RESPONSE dynamic greeting", query=question, system=system.content)
         # max_tokens caps the RESERVED completion budget Groq counts toward
         # its TPM rate limit -- see agents/sql_agent.py's identical comment.
-        llm      = ChatGroq(model=_MODEL, temperature=0.8, max_tokens=256, max_retries=0)
+        llm      = ChatGroq(model=_MODEL, temperature=0.8, max_tokens=256, max_retries=1)
         response = llm.invoke([system, HumanMessage(content=question)])
         return response.content
     except Exception:
@@ -388,7 +388,7 @@ async def run(question: str, scratchpad: list[dict], messages: list | None = Non
             )
             # max_tokens caps the RESERVED completion budget Groq counts
             # toward its TPM rate limit -- see sql_agent.py's identical comment.
-            llm      = ChatGroq(model=_MODEL, temperature=0.8, max_tokens=512, max_retries=0)
+            llm      = ChatGroq(model=_MODEL, temperature=0.8, max_tokens=512, max_retries=1)
             response = llm.invoke([_SYSTEM_CHAT, HumanMessage(content=chat_prompt)])
             return response.content
         except Exception:
@@ -493,7 +493,7 @@ async def run(question: str, scratchpad: list[dict], messages: list | None = Non
             # comment. Higher than the other response_agent calls since
             # formatting up to 50 rows (the SQL agent's own LIMIT) genuinely
             # needs more output room.
-            llm      = ChatGroq(model=_MODEL, temperature=0.3, max_tokens=2048, max_retries=0)
+            llm      = ChatGroq(model=_MODEL, temperature=0.3, max_tokens=2048, max_retries=1)
             response = llm.invoke([_SQL_FORMAT_SYSTEM, HumanMessage(content=prompt)])
             return response.content
         except Exception:
@@ -549,7 +549,7 @@ async def run(question: str, scratchpad: list[dict], messages: list | None = Non
         )
         # max_tokens caps the RESERVED completion budget Groq counts toward
         # its TPM rate limit -- see sql_agent.py's identical comment.
-        llm      = ChatGroq(model=_MODEL, temperature=0.3, max_tokens=1536, max_retries=0)
+        llm      = ChatGroq(model=_MODEL, temperature=0.3, max_tokens=1536, max_retries=1)
         response = llm.invoke([_SYSTEM_COMBINE, HumanMessage(content="\n\n".join(parts))])
         return response.content
     except Exception:

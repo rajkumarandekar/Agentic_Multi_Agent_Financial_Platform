@@ -32,6 +32,7 @@ from langchain_core.tools import tool
 from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 
+from agents.groq_errors import is_rate_limited, RATE_LIMIT_MESSAGE
 from agents.finance_agent import (
     _MODEL,
     COMPANY,
@@ -401,7 +402,7 @@ async def run(question: str, knowledge_result: dict | None = None, messages: lis
 
     # max_tokens caps the RESERVED completion budget Groq counts toward its
     # TPM rate limit -- see agents/sql_agent.py's identical comment.
-    llm   = ChatGroq(model=_MODEL, temperature=0, max_tokens=1024, max_retries=0)
+    llm   = ChatGroq(model=_MODEL, temperature=0, max_tokens=1024, max_retries=1)
     agent = create_react_agent(
         llm, _ALL_TOOLS,
         state_modifier=SystemMessage(content=_SYSTEM_PROMPT),
@@ -431,4 +432,6 @@ async def run(question: str, knowledge_result: dict | None = None, messages: lis
         return "Request timed out. Please try again."
     except Exception as exc:
         logger.error("credit_agent error: %s", exc, exc_info=True)
+        if is_rate_limited(exc):
+            return RATE_LIMIT_MESSAGE
         return "Unable to complete the credit analysis. Please rephrase the question."

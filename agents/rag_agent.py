@@ -80,7 +80,7 @@ def ask(
 
     # max_tokens caps the RESERVED completion budget Groq counts toward its
     # TPM rate limit -- see agents/sql_agent.py's identical comment.
-    llm = ChatGroq(model=GROQ_MODEL, temperature=0, max_tokens=1024, max_retries=0)
+    llm = ChatGroq(model=GROQ_MODEL, temperature=0, max_tokens=1024, max_retries=1)
     response = llm.invoke([
         SystemMessage(content=system_prompt),
         HumanMessage(content=f"Context:\n{context}\n\nQuestion: {question}"),
