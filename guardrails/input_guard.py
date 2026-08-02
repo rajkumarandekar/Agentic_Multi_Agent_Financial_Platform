@@ -11,6 +11,7 @@ one LLM call instead of two.
 
 import os
 import re
+from functools import lru_cache
 
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
@@ -80,9 +81,17 @@ def _check_injection_patterns(question: str) -> dict:
     }
 
 
+@lru_cache(maxsize=512)
 def _check_llm_safety(question: str) -> dict:
     """
     Ask the LLM to classify the question as SAFE or UNSAFE.
+
+    Cached on the exact question text -- this is a pure classification of
+    the text itself, no session/conversation context involved, so an
+    identical repeat (same user re-asking, or just heavy test traffic
+    against a handful of sample questions) costs zero extra Groq calls.
+    Directly cuts call volume against Groq's rate limit, which is the
+    actual bottleneck this project hits, not model quality.
 
     Fails open (treated as SAFE) on a Groq error — consistent with this
     classifier's own "be permissive" instructions. The regex pattern check

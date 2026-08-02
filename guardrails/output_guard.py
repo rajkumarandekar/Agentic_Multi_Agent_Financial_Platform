@@ -11,6 +11,7 @@ Two sequential checks:
 
 import os
 import re
+from functools import lru_cache
 
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
@@ -66,9 +67,17 @@ def _check_pii(text: str) -> tuple[str, dict]:
     }
 
 
+@lru_cache(maxsize=512)
 def _check_toxicity(text: str) -> dict:
     """
     Ask the LLM whether the answer contains harmful content.
+
+    Cached on the exact (already-masked) answer text -- a pure
+    classification of the text itself, no session context. Repeated/similar
+    answers (heavy test traffic, or two users asking the same thing) cost
+    zero extra Groq calls. See input_guard.py's _check_llm_safety for the
+    identical rationale -- this directly cuts call volume against Groq's
+    rate limit.
 
     Fails open (treated as not toxic) on a Groq error. The answer already
     passed through its source agent (finance/SQL/RAG all pull from a fixed,
