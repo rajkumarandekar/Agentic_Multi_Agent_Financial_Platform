@@ -961,7 +961,7 @@ async def run(question: str) -> str:
     """
     import logging
     _log = logging.getLogger(__name__)
-    llm   = ChatGroq(model=GROQ_MODEL, temperature=0, max_retries=1)
+    llm   = ChatGroq(model=GROQ_MODEL, temperature=0, max_retries=0)
     agent = create_react_agent(llm, _ALL_TOOLS, state_modifier=_SYSTEM_PROMPT)
     try:
         result = await agent.ainvoke(

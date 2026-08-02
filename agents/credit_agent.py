@@ -401,7 +401,7 @@ async def run(question: str, knowledge_result: dict | None = None, messages: lis
 
     # max_tokens caps the RESERVED completion budget Groq counts toward its
     # TPM rate limit -- see agents/sql_agent.py's identical comment.
-    llm   = ChatGroq(model=_MODEL, temperature=0, max_tokens=1024, max_retries=1)
+    llm   = ChatGroq(model=_MODEL, temperature=0, max_tokens=1024, max_retries=0)
     agent = create_react_agent(
         llm, _ALL_TOOLS,
         state_modifier=SystemMessage(content=_SYSTEM_PROMPT),

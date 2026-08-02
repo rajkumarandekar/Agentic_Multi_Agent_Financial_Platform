@@ -332,7 +332,7 @@ def run(question: str, messages: list | None = None, entity_question: str | None
     # output allowance regardless of actual answer length, which was
     # confirmed live to trigger repeated 413 "rate_limit_exceeded" errors
     # even for short questions/results (see project chat history).
-    llm = ChatGroq(model=SQL_MODEL, temperature=0, max_tokens=1024, max_retries=1)
+    llm = ChatGroq(model=SQL_MODEL, temperature=0, max_tokens=1024, max_retries=0)
     agent = create_react_agent(
         llm, [execute_sql_tool],
         state_modifier=SystemMessage(content=system_prompt),

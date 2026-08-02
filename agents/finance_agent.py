@@ -2354,7 +2354,7 @@ async def run(
     # TPM rate limit -- left unset, Groq reserves the model's full max
     # output allowance regardless of actual answer length, confirmed live
     # to cause repeated 413 "rate_limit_exceeded" errors this session.
-    llm   = ChatGroq(model=_MODEL, temperature=0, max_tokens=1024, max_retries=1)
+    llm   = ChatGroq(model=_MODEL, temperature=0, max_tokens=1024, max_retries=0)
     agent = create_react_agent(
         llm, _ALL_TOOLS,
         state_modifier=SystemMessage(content=_SYSTEM_PROMPT),

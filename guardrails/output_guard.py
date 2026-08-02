@@ -78,7 +78,7 @@ def _check_toxicity(text: str) -> dict:
     """
     try:
         trace_llm_call("OUTPUT GUARD toxicity check", query=text[:1000], system=_TOXICITY_SYSTEM)
-        llm = ChatGroq(model=GROQ_MODEL, temperature=0)
+        llm = ChatGroq(model=GROQ_MODEL, temperature=0, max_retries=0)
         # Truncate to keep prompt cost low; 1 000 chars covers typical answers.
         response = llm.invoke([
             SystemMessage(content=_TOXICITY_SYSTEM),
