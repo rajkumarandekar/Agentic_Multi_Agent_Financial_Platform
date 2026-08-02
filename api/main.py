@@ -28,6 +28,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
+from groq import RateLimitError as GroqRateLimitError
 
 # --- configure JSON logging before anything else emits log lines ---
 from observability.logger import configure_logging, new_request_id
@@ -106,6 +107,21 @@ async def _startup() -> None:
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     await close_sqlite_checkpointer()
+
+
+def _error_detail(exc: Exception) -> str:
+    """
+    Turn a graph failure into user-facing text.
+
+    Groq's own client retries a 429 internally (with Retry-After-based
+    backoff) before ever raising -- by the time GroqRateLimitError reaches
+    here, the quota is genuinely exhausted, not a blip. Surface that
+    plainly instead of a raw "RateLimitError: Error code: 429 - ..." dump,
+    which reads like a crash rather than "try again shortly."
+    """
+    if isinstance(exc, GroqRateLimitError):
+        return "Groq's request limit has been reached for now. Please try again in a minute."
+    return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
 
 # ---------------------------------------------------------------------------
@@ -339,8 +355,8 @@ async def agent_endpoint(body: AgentRequest) -> AgentResponse:
                    "error": str(exc)},
         )
         logger.debug("traceback:\n%s", traceback.format_exc())
-        detail = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
-        raise HTTPException(status_code=500, detail=detail) from exc
+        status_code = 429 if isinstance(exc, GroqRateLimitError) else 500
+        raise HTTPException(status_code=status_code, detail=_error_detail(exc)) from exc
 
     total_ms = (time.perf_counter() - t_start) * 1000
 
@@ -481,8 +497,7 @@ async def agent_stream_endpoint(body: AgentRequest) -> StreamingResponse:
                        "error": str(exc)},
             )
             logger.debug("traceback:\n%s", traceback.format_exc())
-            detail = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
-            yield f"event: error\ndata: {json.dumps({'detail': detail})}\n\n"
+            yield f"event: error\ndata: {json.dumps({'detail': _error_detail(exc)})}\n\n"
             return
 
         total_ms = (time.perf_counter() - t_start) * 1000

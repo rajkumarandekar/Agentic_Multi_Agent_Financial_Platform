@@ -53,7 +53,7 @@ def clarify_node(state: AgentState) -> dict:
     try:
         # max_tokens caps the RESERVED completion budget Groq counts toward
         # its TPM rate limit -- see agents/sql_agent.py's identical comment.
-        llm = ChatGroq(model=_MODEL, temperature=0.3, max_tokens=256)
+        llm = ChatGroq(model=_MODEL, temperature=0.3, max_tokens=256, max_retries=1)
         resp = llm.invoke([
             SystemMessage(content=_CLARIFY_SYSTEM),
             HumanMessage(
