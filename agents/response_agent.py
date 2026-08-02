@@ -493,7 +493,14 @@ async def run(question: str, scratchpad: list[dict], messages: list | None = Non
             # comment. Higher than the other response_agent calls since
             # formatting up to 50 rows (the SQL agent's own LIMIT) genuinely
             # needs more output room.
-            llm      = ChatGroq(model=_MODEL, temperature=0.3, max_tokens=2048, max_retries=1)
+            # temperature=0 (not 0.3) -- this is a deterministic reformat of
+            # real rows already fetched, not creative generation. Confirmed
+            # live that this exact call can occasionally produce a
+            # hallucinated "no results" table even when given real non-empty
+            # sql_result -- 0 doesn't guarantee eliminating that (still an
+            # LLM call, still at the mercy of Groq's own reliability), but
+            # removes the one variance knob this code controls.
+            llm      = ChatGroq(model=_MODEL, temperature=0, max_tokens=2048, max_retries=1)
             response = llm.invoke([_SQL_FORMAT_SYSTEM, HumanMessage(content=prompt)])
             return response.content
         except Exception:
