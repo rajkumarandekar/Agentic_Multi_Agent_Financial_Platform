@@ -31,7 +31,7 @@ import re
 
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 
 from observability.trace import trace_agent_start, trace_llm_call
 from orchestration import followup
@@ -44,20 +44,21 @@ load_dotenv()
 # the rest of the app's cheap/fast calls -- this is the ONE place a bad
 # judgment call cascades into every downstream agent, and it's a single
 # short call per turn, so the cost of a bigger model here is negligible.
-# Routing/verification run on Gemini rather than Groq (every other agent in
-# this codebase still uses ChatGroq) -- this is an isolated experiment: only
-# the one-word routing/verifier calls below are affected, every actual
-# answer (finance/sql/credit/risk/forecast/rag/response) is untouched and
-# still Groq. Needs GOOGLE_API_KEY set (same key ingestion/pdf_ingest.py's
-# Gemini embeddings experiment already uses).
+# llama-3.3-70b-versatile is Groq's actual available 70B-class model
+# (verified via client.models.list(), not guessed) and is closer to how a
+# real ChatGPT-style orchestrator is built: the strongest model available
+# does the orchestrating, even when it delegates to cheaper specialist tools.
 #
-# Pinned dated models (gemini-2.0-flash, gemini-2.0-flash-lite) returned
-# `429 RESOURCE_EXHAUSTED ... limit: 0` on this project's API key -- a hard
-# zero quota, not a transient rate limit (verified live). "gemini-flash-latest"
-# is the only alias that actually returned content on this key. Revisit if
-# billing/quota is fixed on the Google Cloud project -- an alias can point to
-# a different model without notice, which a pinned dated model wouldn't.
-_ROUTER_MODEL   = os.getenv("ROUTER_MODEL", "gemini-flash-latest")
+# Briefly swapped to Gemini (gemini-flash-latest) -- reverted after live
+# testing on the deployed HF Space showed 30-120+s hangs/timeouts on
+# nearly every request. Root cause: this project's Gemini API key is on
+# the free tier, which rate-limits far more aggressively than Groq's, and
+# ChatGoogleGenerativeAI silently retries with exponential backoff on
+# 429s instead of failing fast -- since routing runs on every single
+# message, that backoff stacked into the whole app hanging or timing out
+# unpredictably. Don't re-attempt without capping max_retries/timeout and
+# adding a fast fallback to Groq first.
+_ROUTER_MODEL   = os.getenv("ROUTER_MODEL", "llama-3.3-70b-versatile")
 _MAX_ITERATIONS = 3
 _VALID_ROUTES   = {
     "sql", "rag", "finance", "research", "credit", "risk", "forecast",
@@ -85,26 +86,6 @@ _GREETING_RE = re.compile(
     r'how\s+can\s+(you|u)\s+help|help\s*[?!.]*)\s*[?!.]*\s*$',
     re.IGNORECASE,
 )
-
-def _extract_text(content) -> str:
-    """
-    Normalize an LLM response's `.content` to plain text.
-
-    ChatGroq always returns a plain string. Gemini's newer "thinking" models
-    (e.g. gemini-flash-latest) instead return a list of content blocks like
-    [{"type": "text", "text": "sql", ...}] -- confirmed live against this
-    project's real Google API key. Plain `.strip()` on that list would raise
-    AttributeError, so pull the text out of whichever shape comes back.
-    """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
-            block.get("text", "") for block in content
-            if isinstance(block, dict) and block.get("type") == "text"
-        )
-    return str(content)
-
 
 # research has no TechMart data of its own -- a question asking to compare
 # an external/industry figure against "our"/"TechMart's" own numbers needs a
@@ -266,7 +247,7 @@ def _route_question(
             SystemMessage(content=_ROUTER_SYSTEM_PROMPT),
             HumanMessage(content=human_msg),
         ])
-        raw = _extract_text(response.content).strip().lower()
+        raw = response.content.strip().lower()
     except Exception as exc:
         print(f"[supervisor] router call failed ({exc}) -> done")
         return "done"
@@ -317,7 +298,7 @@ def _is_answer_sufficient(question: str, scratchpad: str, llm) -> bool:
                 f"Is the question already fully answered? Reply YES or NO."
             )),
         ])
-        return _extract_text(response.content).strip().upper().startswith("Y")
+        return response.content.strip().upper().startswith("Y")
     except Exception as exc:
         print(f"[supervisor] verifier call failed ({exc}) -> assume not sufficient")
         return False
@@ -403,17 +384,16 @@ def supervisor_node(state: AgentState) -> dict:
     # at whether a second agent is still needed.
     if agents_run:
         scratchpad_text_for_verify = _build_scratchpad(state)
-        # max_output_tokens caps the RESERVED completion budget the provider
-        # counts toward its rate limit, not just actual output length -- left
-        # unset (None), Groq reserves the model's full max output allowance
+        # max_tokens caps the RESERVED completion budget Groq counts toward
+        # the TPM limit, not just actual output length -- left unset
+        # (None), Groq reserves the model's full max output allowance
         # regardless of how short the real answer is. Confirmed live: this
         # was the actual cause of repeated 413 "rate_limit_exceeded" errors
-        # this session across multiple agents, not genuine traffic volume.
-        # 200 (not 10) because gemini-flash-latest is a "thinking" model that
-        # spends part of this budget on hidden reasoning tokens before the
-        # visible YES/NO -- confirmed live that 10 silently returned empty
-        # content (finish_reason=MAX_TOKENS with zero visible text).
-        verifier_llm = ChatGoogleGenerativeAI(model=_ROUTER_MODEL, temperature=0, max_output_tokens=200)
+        # this session across multiple agents, not genuine traffic volume
+        # -- a one-word YES/NO or routing answer was still being billed
+        # against a multi-thousand-token reservation. 10 is generous for a
+        # single word.
+        verifier_llm = ChatGroq(model=_ROUTER_MODEL, temperature=0, max_tokens=10)
         if _is_answer_sufficient(question, scratchpad_text_for_verify, verifier_llm):
             print(f"[supervisor] verifier: question already fully answered -> done")
             return {"route": "done", "iteration_count": n}
@@ -440,7 +420,7 @@ def supervisor_node(state: AgentState) -> dict:
 
     # ── LLM Call: Route the question (skipped if the fast path was confident) ─
     if route is None:
-        llm   = ChatGoogleGenerativeAI(model=_ROUTER_MODEL, temperature=0, max_output_tokens=200)  # one-word route, see verifier_llm's comment above
+        llm   = ChatGroq(model=_ROUTER_MODEL, temperature=0, max_tokens=10)  # one-word route, see verifier_llm's comment above
         route = _route_question(
             question=question,
             history=history,

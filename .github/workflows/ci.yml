@@ -30,14 +30,8 @@ jobs:
         # No real API keys are configured as secrets -- most tests that would
         # need Groq/Tavily/Google calls monkeypatch those env vars out and
         # assert on the resulting "not configured" behavior instead. A handful
-        # of error-path tests only construct a ChatGroq/ChatGoogleGenerativeAI
-        # client (never call the network) but still need *a* key present, so
-        # a dummy value is enough. GOOGLE_API_KEY specifically: with no key
-        # at all, ChatGoogleGenerativeAI falls back to Google Application
-        # Default Credentials during .invoke() and raises
-        # DefaultCredentialsError on the runner (confirmed live) -- a dummy
-        # string avoids that path entirely.
+        # of error-path tests only construct a ChatGroq client (never call the
+        # network) but still need *a* key present, so a dummy value is enough.
         env:
           GROQ_API_KEY: dummy-ci-key
-          GOOGLE_API_KEY: dummy-ci-key
         run: python -m pytest -q
