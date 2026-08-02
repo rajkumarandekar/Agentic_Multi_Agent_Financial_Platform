@@ -37,6 +37,20 @@ from langchain_groq import ChatGroq
 
 from observability.trace import trace_llm_call
 
+# NOTE: GROQ_MODEL/SQL_MODEL/FINANCE_MODEL all default to the SAME
+# llama-3.1-8b-instant, whose TPM (tokens-per-minute) limit on this
+# project's Groq key is only 6000 -- confirmed live this is genuinely
+# tight enough that a single request's sql_agent react-loop plus this
+# module's own formatting call can starve each other. Tried moving this
+# module to a separate-pool model (openai/gpt-oss-20b, qwen/qwen3.6-27b)
+# to relieve that -- both are reasoning models that hide/truncate real
+# output before ever reaching the visible answer at normal token budgets
+# (same failure class as the Gemini router experiment, see
+# orchestration/supervisor.py's comment) and were reverted rather than
+# trade one bug for a worse one. The actual fix needs either a genuinely
+# non-reasoning alternative model (untested here) or shrinking
+# sql_agent's system prompt so less of the 6000 TPM budget gets consumed
+# per request -- not a same-day swap.
 _MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
 # ── SQL formatting template ───────────────────────────────────────────────────
