@@ -24,8 +24,12 @@ export async function sendMessage(question, sessionId, sourceDocument = null, ag
       // Without this, a stalled request (e.g. Groq rate-limit retries piling
       // up server-side) hangs the fetch indefinitely — handleSend's own
       // try/catch/finally already clears the loading spinner on any thrown
-      // error, but only if the fetch promise actually settles.
-      signal: AbortSignal.timeout(60000),
+      // error, but only if the fetch promise actually settles. 120s (not
+      // 60s) -- confirmed live that credit/risk/forecast agents (sklearn/
+      // statsmodels model loading on the deployed Space's shared CPU) can
+      // genuinely take over 60s, and 60s was aborting real in-flight
+      // requests ("BodyStreamBuffer was aborted"), not just hung ones.
+      signal: AbortSignal.timeout(120000),
     })
   } catch (err) {
     throw new Error(err.name === 'TimeoutError' ? 'Request timed out. Please try again.' : err.message)
@@ -77,10 +81,12 @@ export async function sendMessageStream(question, sessionId, sourceDocument = nu
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-      // Covers the whole stream, not just the initial response -- generous
-      // since chunk delivery is paced in milliseconds, not seconds, even for
-      // long answers (see api/main.py's _STREAM_CHUNK_DELAY_S).
-      signal: AbortSignal.timeout(60000),
+      // Covers the whole stream, not just the initial response. 120s (not
+      // 60s) -- see sendMessage's identical timeout above for why: slower
+      // agents can genuinely exceed 60s on the deployed Space, and chunk
+      // delivery itself is paced in milliseconds so it never accounts for
+      // meaningful time here (see api/main.py's _STREAM_CHUNK_DELAY_S).
+      signal: AbortSignal.timeout(120000),
     })
   } catch (err) {
     throw new Error(err.name === 'TimeoutError' ? 'Request timed out. Please try again.' : err.message)
